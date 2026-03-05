@@ -1,7 +1,57 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from abc import abstractmethod
+from io import BytesIO
+
+import numpy as np
 from PIL import Image
+
+from vllm.utils.registry import ExtensionManager
+
+
+class ImageLoader:
+    @classmethod
+    @abstractmethod
+    def load_bytes(cls, data: bytes, **kwargs) -> Image.Image | np.ndarray:
+        raise NotImplementedError
+
+
+IMAGE_LOADER_REGISTRY = ExtensionManager()
+
+
+@IMAGE_LOADER_REGISTRY.register("pil")
+class PILImageLoader(ImageLoader):
+    @classmethod
+    def load_bytes(cls, data: bytes, **kwargs) -> Image.Image:
+        return Image.open(BytesIO(data))
+
+
+@IMAGE_LOADER_REGISTRY.register("nvimagecodec")
+class NVImageCodecLoader(ImageLoader):
+    @classmethod
+    def load_bytes(cls, data: bytes, **kwargs) -> np.ndarray:
+        try:
+            from nvidia import nvimgcodec
+        except ImportError as exc:
+            raise ImportError(
+                "nvimagecodec is not available. Please install the NVIDIA "
+                "nvImageCodec Python package to use image_backend='nvimagecodec'."
+            ) from exc
+
+        try:
+            decoder = nvimgcodec.Decoder()
+            decoded = decoder.decode(data)
+            if decoded is None:
+                raise ValueError("nvimagecodec failed to decode image bytes.")
+
+            decoded_cpu = decoded.cpu()
+            if decoded_cpu is None:
+                raise ValueError("nvimagecodec failed to copy decoded image to CPU.")
+
+            return np.asarray(decoded_cpu)
+        except Exception as exc:
+            raise ValueError(f"Failed to decode image with nvimagecodec: {exc}") from exc
 
 
 def rescale_image_size(
