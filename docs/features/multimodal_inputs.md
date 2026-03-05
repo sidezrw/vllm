@@ -215,6 +215,41 @@ When loading RGBA images (images with transparency), vLLM converts them to RGB f
     - This setting only affects RGBA images with transparency; RGB images are unchanged
     - If not specified, the default white background `(255, 255, 255)` is used for backward compatibility
 
+#### Select Image Decoder Backend
+
+vLLM supports selecting the image decoder backend in the same style as video decoding.
+By default, vLLM uses `pil` (Pillow).
+
+You can set a global default backend via environment variable:
+
+```bash
+export VLLM_IMAGE_LOADER_BACKEND=pil
+```
+
+Or override it per model/request through `media_io_kwargs`:
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="llava-hf/llava-1.5-7b-hf",
+    media_io_kwargs={"image": {"image_backend": "pil"}},
+)
+```
+
+To use NVIDIA nvImageCodec on supported systems:
+
+```python
+llm = LLM(
+    model="llava-hf/llava-1.5-7b-hf",
+    media_io_kwargs={"image": {"image_backend": "nvimagecodec"}},
+)
+```
+
+!!! note
+    - `nvimagecodec` is optional and best suited for NVIDIA hardware.
+    - If `media_io_kwargs["image"]["image_backend"]` is set, it takes precedence over `VLLM_IMAGE_LOADER_BACKEND`.
+
 ### Video Inputs
 
 You can pass a list of NumPy arrays directly to the `'video'` field of the multi-modal dictionary
