@@ -3,6 +3,7 @@
 
 from abc import abstractmethod
 from io import BytesIO
+import threading
 
 import numpy as np
 from PIL import Image
@@ -29,8 +30,10 @@ class PILImageLoader(ImageLoader):
 
 @IMAGE_LOADER_REGISTRY.register("nvimagecodec")
 class NVImageCodecLoader(ImageLoader):
+    _thread_local = threading.local()
+
     @classmethod
-    def load_bytes(cls, data: bytes, **kwargs) -> np.ndarray:
+    def _get_decoder(cls):
         try:
             from nvidia import nvimgcodec
         except ImportError as exc:
@@ -39,8 +42,17 @@ class NVImageCodecLoader(ImageLoader):
                 "nvImageCodec Python package to use image_backend='nvimagecodec'."
             ) from exc
 
-        try:
+        decoder = getattr(cls._thread_local, "decoder", None)
+        if decoder is None:
             decoder = nvimgcodec.Decoder()
+            cls._thread_local.decoder = decoder
+
+        return decoder
+
+    @classmethod
+    def load_bytes(cls, data: bytes, **kwargs) -> np.ndarray:
+        try:
+            decoder = cls._get_decoder()
             decoded = decoder.decode(data)
             if decoded is None:
                 raise ValueError("nvimagecodec failed to decode image bytes.")
