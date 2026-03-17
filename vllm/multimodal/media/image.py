@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from io import BytesIO
+import os
 from pathlib import Path
+import threading
+import time
 
 import pybase64
 import torch
@@ -16,6 +19,12 @@ from .base import MediaIO, MediaWithBytes
 
 
 class ImageMediaIO(MediaIO[Image.Image]):
+    _thread_local = threading.local()
+    _cache_first_result_enabled = bool(
+        int(os.getenv("VLLM_IMAGE_DECODE_CACHE_ENABLED", "0"))
+    )
+    _cache_sleep_ms = int(os.getenv("VLLM_IMAGE_DECODE_SLEEP_MS", "0"))
+
     def __init__(self, image_mode: str = "RGB", **kwargs) -> None:
         super().__init__()
 
@@ -50,6 +59,26 @@ class ImageMediaIO(MediaIO[Image.Image]):
             )
         self.rgba_background_color = rgba_bg
 
+    @classmethod
+    def _get_cached_media(cls) -> MediaWithBytes[Image.Image] | None:
+        cached_media = getattr(cls._thread_local, "cached_media", None)
+        if cached_media is None:
+            return None
+
+        if cls._cache_sleep_ms > 0:
+            time.sleep(cls._cache_sleep_ms / 1000.0)
+
+        return MediaWithBytes(cached_media.media.copy(), cached_media.original_bytes)
+
+    @classmethod
+    def _set_cached_media(cls, media: MediaWithBytes[Image.Image]) -> None:
+        if getattr(cls._thread_local, "cached_media", None) is not None:
+            return
+
+        cls._thread_local.cached_media = MediaWithBytes(
+            media.media.copy(), media.original_bytes
+        )
+
     def _to_pil_image(self, image: Image.Image | object) -> Image.Image:
         if isinstance(image, Image.Image):
             return image
@@ -74,9 +103,23 @@ class ImageMediaIO(MediaIO[Image.Image]):
             return convert_image_mode(image, self.image_mode)
 
     def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
+        if self._cache_first_result_enabled:
+            cached_media = self._get_cached_media()
+            if cached_media is not None:
+                return cached_media
+
         image = self.image_loader.load_bytes(data, **self.kwargs)
         image = self._to_pil_image(image)
-        return MediaWithBytes(self._convert_image_mode(image), data)
+        image = self._convert_image_mode(image)
+        media = MediaWithBytes(image, data)
+
+        if self._cache_first_result_enabled:
+            self._set_cached_media(media)
+            cached_media = self._get_cached_media()
+            if cached_media is not None:
+                return cached_media
+
+        return media
 
     def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:
         return self.load_bytes(pybase64.b64decode(data, validate=True))
