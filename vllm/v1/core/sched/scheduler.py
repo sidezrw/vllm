@@ -55,6 +55,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.batch_packing_trace import trace_schedule_batch
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
@@ -889,6 +890,18 @@ class Scheduler(SchedulerInterface):
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        trace_schedule_batch(
+            [
+                *scheduled_running_reqs,
+                *scheduled_resumed_reqs,
+                *scheduled_new_reqs,
+            ],
+            scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_encoder_inputs=scheduled_encoder_inputs,
+            waiting_size=len(self.waiting),
+            running_size=len(self.running),
+        )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,

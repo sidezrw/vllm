@@ -389,10 +389,6 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        step_sleep_s = int(os.getenv("VLLM_DEBUG_ENGINE_STEP_SLEEP_S", "0"))
-        if step_sleep_s > 0:
-            print("-" * 20, f"Stepping for {step_sleep_s} seconds")
-            time.sleep(step_sleep_s)
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -451,10 +447,6 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            step_sleep_s = int(os.getenv("VLLM_DEBUG_ENGINE_STEP_SLEEP_S", "0"))
-            if step_sleep_s > 0:
-                print("-" * 20, f"Stepping for {step_sleep_s} seconds")
-                time.sleep(step_sleep_s)
             scheduler_output = self.scheduler.schedule()
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True

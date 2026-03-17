@@ -123,6 +123,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.batch_packing_trace import trace_execute_batch
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -3451,6 +3452,13 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            trace_execute_batch(
+                req_ids=req_ids,
+                requests_by_id=self.requests,
+                scheduled_tokens=num_tokens_unpadded,
+                scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+            )
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,

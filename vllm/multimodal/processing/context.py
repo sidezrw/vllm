@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import threading
 import time
 from abc import abstractmethod
 from collections.abc import Mapping
@@ -40,6 +42,37 @@ else:
     ModelConfig = object
 
 logger = init_logger(__name__)
+
+_thread_local = threading.local()
+
+
+def _copy_processor_output(x: object) -> object:
+    if isinstance(x, torch.Tensor):
+        return x.clone()
+    if isinstance(x, dict):
+        return {key: _copy_processor_output(value) for key, value in x.items()}
+    if isinstance(x, list):
+        return [_copy_processor_output(value) for value in x]
+    if isinstance(x, tuple):
+        return tuple(_copy_processor_output(value) for value in x)
+
+    return x
+
+
+def _is_image_preprocess_cache_enabled() -> bool:
+    return bool(int(os.getenv("VLLM_IMAGE_PREPROCESS_CACHE_ENABLED", "0")))
+
+
+def _has_image_inputs(data: Mapping[str, object]) -> bool:
+    return "images" in data
+
+
+def _get_cached_hf_output() -> object | None:
+    return getattr(_thread_local, "cached_hf_output", None)
+
+
+def _set_cached_hf_output(output: object) -> None:
+    _thread_local.cached_hf_output = _copy_processor_output(output)
 
 
 @dataclass
@@ -253,6 +286,9 @@ class InputProcessingContext:
         (text, image, audio...) with configurable options `kwargs`.
         """
         assert callable(hf_processor)
+        should_use_image_cache = (
+            _is_image_preprocess_cache_enabled() and _has_image_inputs(data)
+        )
 
         merged_kwargs = self.get_merged_mm_kwargs(kwargs)
 
@@ -263,8 +299,43 @@ class InputProcessingContext:
             allow_var_kwargs=True,
         )
 
+        cached_output = _get_cached_hf_output() if should_use_image_cache else None
+        if cached_output is not None:
+            from transformers.feature_extraction_utils import BatchFeature
+
+            cached_copy_start = time.perf_counter()
+            cached_output_copy = _copy_processor_output(cached_output)
+            cached_copy_ms = (time.perf_counter() - cached_copy_start) * 1000.0
+            print(
+                "[hf_processor] reusing cached preprocessed image output "
+                f"(copy_ms={cached_copy_ms:.3f})"
+            )
+            return BatchFeature(cached_output_copy)
+
         try:
+            processor_start = time.perf_counter()
             output = hf_processor(**data, **allowed_kwargs, return_tensors="pt")
+            processor_elapsed_ms = (time.perf_counter() - processor_start) * 1000.0
+            pixel_values = output.get("pixel_values") if hasattr(output, "get") else None
+            if pixel_values is not None:
+                if hasattr(pixel_values, "shape"):
+                    pixel_values_shape: object = tuple(pixel_values.shape)
+                elif isinstance(pixel_values, list):
+                    pixel_values_shape = [
+                        tuple(item.shape) if hasattr(item, "shape") else type(item).__name__
+                        for item in pixel_values
+                    ]
+                else:
+                    pixel_values_shape = type(pixel_values).__name__
+                print(
+                    "[hf_processor] pixel_values shape: "
+                    f"{pixel_values_shape} (processor_ms={processor_elapsed_ms:.3f})"
+                )
+            else:
+                print(
+                    "[hf_processor] pixel_values is None "
+                    f"(processor_ms={processor_elapsed_ms:.3f})"
+                )
         except Exception as exc:
             # See https://github.com/huggingface/tokenizers/issues/537
             if (
@@ -300,6 +371,9 @@ class InputProcessingContext:
 
         if isinstance(output, BatchFeature):
             output_ = self._postprocess_output(output.data)
+            if should_use_image_cache and output.get("pixel_values") is not None:
+                _set_cached_hf_output(output_)
+                print("[hf_processor] cached first preprocessed image output")
             return BatchFeature(output_)
 
         logger.warning_once(
