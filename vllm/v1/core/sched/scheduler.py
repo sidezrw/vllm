@@ -901,6 +901,7 @@ class Scheduler(SchedulerInterface):
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             waiting_size=len(self.waiting),
             running_size=len(self.running),
+            finished_req_ids=self.finished_req_ids,
         )
 
         scheduler_output = SchedulerOutput(

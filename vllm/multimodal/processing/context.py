@@ -306,10 +306,10 @@ class InputProcessingContext:
             cached_copy_start = time.perf_counter()
             cached_output_copy = _copy_processor_output(cached_output)
             cached_copy_ms = (time.perf_counter() - cached_copy_start) * 1000.0
-            print(
-                "[hf_processor] reusing cached preprocessed image output "
-                f"(copy_ms={cached_copy_ms:.3f})"
-            )
+            # print(
+            #     "[hf_processor] reusing cached preprocessed image output "
+            #     f"(copy_ms={cached_copy_ms:.3f})"
+            # )
             return BatchFeature(cached_output_copy)
 
         try:
@@ -327,15 +327,16 @@ class InputProcessingContext:
                     ]
                 else:
                     pixel_values_shape = type(pixel_values).__name__
-                print(
-                    "[hf_processor] pixel_values shape: "
-                    f"{pixel_values_shape} (processor_ms={processor_elapsed_ms:.3f})"
-                )
+                # print(
+                #     "[hf_processor] pixel_values shape: "
+                #     f"{pixel_values_shape} (processor_ms={processor_elapsed_ms:.3f})"
+                # )
             else:
-                print(
-                    "[hf_processor] pixel_values is None "
-                    f"(processor_ms={processor_elapsed_ms:.3f})"
-                )
+                # print(
+                #     "[hf_processor] pixel_values is None "
+                #     f"(processor_ms={processor_elapsed_ms:.3f})"
+                # )
+                pass
         except Exception as exc:
             # See https://github.com/huggingface/tokenizers/issues/537
             if (
@@ -373,7 +374,7 @@ class InputProcessingContext:
             output_ = self._postprocess_output(output.data)
             if should_use_image_cache and output.get("pixel_values") is not None:
                 _set_cached_hf_output(output_)
-                print("[hf_processor] cached first preprocessed image output")
+                # print("[hf_processor] cached first preprocessed image output")
             return BatchFeature(output_)
 
         logger.warning_once(

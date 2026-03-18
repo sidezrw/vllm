@@ -57,6 +57,7 @@ class _TraceWriter:
         self.pid = os.getpid()
         self._lock = threading.Lock()
         self._iteration = 0
+        self._finished_total = 0
         self._file = None
 
         if not self.enabled:
@@ -80,6 +81,10 @@ class _TraceWriter:
     def next_iteration_id(self) -> int:
         self._iteration += 1
         return self._iteration
+
+    def update_finished_total(self, finished_now: int) -> int:
+        self._finished_total += finished_now
+        return self._finished_total
 
     def emit(self, event: str, **fields: Any) -> None:
         if not self.enabled or self._file is None:
@@ -133,11 +138,13 @@ def trace_schedule_batch(
     scheduled_encoder_inputs: dict[str, list[int]],
     waiting_size: int,
     running_size: int,
+    finished_req_ids: set[str],
 ) -> None:
     if not _schedule_batch_trace.enabled:
         return
 
     image_req_count, total_image_count = _count_image_requests(requests)
+    finished_now = len(finished_req_ids)
     _schedule_batch_trace.emit(
         "schedule_batch",
         iteration_id=_schedule_batch_trace.next_iteration_id(),
@@ -150,6 +157,8 @@ def trace_schedule_batch(
         ),
         waiting_size=waiting_size,
         running_size=running_size,
+        finished_now=finished_now,
+        finished_total=_schedule_batch_trace.update_finished_total(finished_now),
     )
 
 
