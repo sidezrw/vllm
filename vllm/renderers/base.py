@@ -697,7 +697,10 @@ class BaseRenderer(ABC, Generic[_T]):
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
-        return [self.process_for_engine(prompt, arrival_time) for prompt in tok_prompts]
+        return list(await asyncio.gather(*[
+            asyncio.to_thread(self.process_for_engine, prompt, arrival_time)
+            for prompt in tok_prompts
+        ]))
 
     def render_chat(
         self,
@@ -761,8 +764,9 @@ class BaseRenderer(ABC, Generic[_T]):
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
-        eng_prompts = [
-            self.process_for_engine(prompt, arrival_time) for prompt in tok_prompts
-        ]
+        eng_prompts = list(await asyncio.gather(*[
+            asyncio.to_thread(self.process_for_engine, prompt, arrival_time)
+            for prompt in tok_prompts
+        ]))
 
         return out_conversations, eng_prompts

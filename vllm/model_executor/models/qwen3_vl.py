@@ -943,6 +943,74 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
 
 
 class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):
+
+    _gpu_preprocessor = None
+
+    def _get_gpu_preprocessor(self):
+        """Lazy-init GPU preprocessor from HF image processor config."""
+        if self._gpu_preprocessor is None:
+            try:
+                from vllm.multimodal.gpu_preprocess import (
+                    Qwen2VLGPUPreprocessor,
+                )
+                image_processor = self.info.get_image_processor()
+                self._gpu_preprocessor = (
+                    Qwen2VLGPUPreprocessor.from_cpu_preprocessor(
+                        image_processor
+                    )
+                )
+            except Exception:
+                self._gpu_preprocessor = False
+        return self._gpu_preprocessor if self._gpu_preprocessor else None
+
+    def _gpu_preprocess_call(
+        self,
+        prompt: str,
+        gpu_images: list,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+        gpu_proc,
+    ) -> BatchFeature:
+        """Process images on GPU and combine with text tokenization."""
+        hf_processor = self.info.get_hf_processor(**mm_kwargs)
+
+        mm_data_no_images = {
+            k: v for k, v in mm_data.items() if k != "images"
+        }
+        from PIL import Image as PILImage
+        dummy_images = []
+        for gpu_img in gpu_images:
+            if gpu_img.ndim == 3:
+                if gpu_img.shape[2] in (1, 3, 4):
+                    h, w = gpu_img.shape[0], gpu_img.shape[1]
+                else:
+                    h, w = gpu_img.shape[1], gpu_img.shape[2]
+            else:
+                h, w = 64, 64
+            dummy_images.append(PILImage.new("RGB", (w, h)))
+
+        hf_output = self.info.ctx.call_hf_processor(
+            hf_processor,
+            dict(text=prompt, images=dummy_images, **mm_data_no_images),
+            dict(**mm_kwargs, **tok_kwargs),
+        )
+
+        all_patches = []
+        all_grid_thw = []
+        for gpu_img in gpu_images:
+            patches, grid_thw = gpu_proc.preprocess_single(gpu_img)
+            all_patches.append(patches)
+            all_grid_thw.append(grid_thw)
+
+        if all_patches:
+            hf_output["pixel_values"] = torch.cat(all_patches, dim=0)
+            hf_output["image_grid_thw"] = torch.tensor(
+                all_grid_thw, dtype=torch.int64
+            )
+
+        return hf_output
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -1061,12 +1129,40 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         else:
             video_outputs = dict()
 
-        processed_outputs = super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
-        )
+        # GPU preprocessing: check if images are CUDA tensors
+        images = mm_data.get("images", None)
+        gpu_images = []
+        cpu_images = []
+
+        if images is not None:
+            for img in images:
+                if isinstance(img, torch.Tensor) and img.is_cuda:
+                    gpu_images.append(img)
+                else:
+                    cpu_images.append(img)
+
+        if gpu_images and not cpu_images:
+            gpu_proc = self._get_gpu_preprocessor()
+            if gpu_proc is not None:
+                processed_outputs = self._gpu_preprocess_call(
+                    prompt, gpu_images, mm_data, mm_kwargs, tok_kwargs,
+                    gpu_proc,
+                )
+            else:
+                processed_outputs = super()._call_hf_processor(
+                    prompt=prompt,
+                    mm_data=mm_data,
+                    mm_kwargs=mm_kwargs,
+                    tok_kwargs=tok_kwargs,
+                )
+        else:
+            processed_outputs = super()._call_hf_processor(
+                prompt=prompt,
+                mm_data=mm_data,
+                mm_kwargs=mm_kwargs,
+                tok_kwargs=tok_kwargs,
+            )
+
         combined_outputs = dict(
             processed_outputs,
             **video_outputs,

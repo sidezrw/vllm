@@ -82,10 +82,24 @@ class ImageMediaIO(MediaIO[Image.Image]):
     def _to_pil_image(self, image: Image.Image | object) -> Image.Image:
         if isinstance(image, Image.Image):
             return image
+        # Handle torch.Tensor (from GPU-resident decoders)
+        if isinstance(image, torch.Tensor):
+            import numpy as np
+            if image.is_cuda:
+                image = image.cpu()
+            arr = image.numpy()
+            return Image.fromarray(arr)
         # Keep loader outputs flexible while preserving PIL-based behavior.
         # Backends can return ndarray-like objects and we normalize here.
         if hasattr(image, "__array_interface__"):
             return Image.fromarray(image)
+        # numpy arrays don't always have __array_interface__ with newer numpy
+        try:
+            import numpy as np
+            if isinstance(image, np.ndarray):
+                return Image.fromarray(image)
+        except ImportError:
+            pass
 
         raise TypeError(f"Unsupported image type: {type(image)!r}")
 
@@ -102,16 +116,30 @@ class ImageMediaIO(MediaIO[Image.Image]):
         else:
             return convert_image_mode(image, self.image_mode)
 
-    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
+    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image] | torch.Tensor:
         if self._cache_first_result_enabled:
             cached_media = self._get_cached_media()
             if cached_media is not None:
                 return cached_media
 
         image = self.image_loader.load_bytes(data, **self.kwargs)
+        # GPU-resident loaders return torch.Tensor on CUDA — pass through
+        # without PIL conversion to preserve zero-copy GPU decode path.
+        if isinstance(image, torch.Tensor) and image.is_cuda:
+            return image
+        # PIL bypass: if backend returned an ndarray that is already in the
+        # target mode (3-channel for RGB), skip the expensive PIL round-trip.
+        # HF's is_valid_image() accepts np.ndarray, so downstream is safe.
+        if (
+            hasattr(image, "__array_interface__")
+            and self.image_mode == "RGB"
+            and hasattr(image, "ndim")
+            and image.ndim == 3
+            and image.shape[2] == 3
+        ):
+            return MediaWithBytes(image, data)
         image = self._to_pil_image(image)
-        image = self._convert_image_mode(image)
-        media = MediaWithBytes(image, data)
+        media = MediaWithBytes(self._convert_image_mode(image), data)
 
         if self._cache_first_result_enabled:
             self._set_cached_media(media)
