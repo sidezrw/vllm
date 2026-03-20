@@ -224,6 +224,11 @@ class MsgpackEncoder:
         self, obj: torch.Tensor
     ) -> tuple[str, tuple[int, ...], int | memoryview]:
         assert self.aux_buffers is not None
+        # Move CUDA tensors to CPU before serialization — needed for
+        # GPU-resident decode pipelines (e.g. nvimagecodec_gpu_resident)
+        # that produce CUDA tensors in the API server process.
+        if obj.is_cuda:
+            obj = obj.cpu()
         # view the tensor as a contiguous 1D array of bytes
         arr_data = tensor_data(obj)
         if obj.nbytes < self.size_threshold:

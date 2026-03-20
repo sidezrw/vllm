@@ -4,6 +4,7 @@ from .audio import AudioEmbeddingMediaIO, AudioMediaIO
 from .base import MediaIO, MediaWithBytes
 from .connector import MEDIA_CONNECTOR_REGISTRY, MediaConnector
 from .image import ImageEmbeddingMediaIO, ImageMediaIO
+from ..image import IMAGE_LOADER_REGISTRY
 from .video import VIDEO_LOADER_REGISTRY, VideoMediaIO
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "AudioMediaIO",
     "ImageEmbeddingMediaIO",
     "ImageMediaIO",
+    "IMAGE_LOADER_REGISTRY",
     "VIDEO_LOADER_REGISTRY",
     "VideoMediaIO",
     "MEDIA_CONNECTOR_REGISTRY",

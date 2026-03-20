@@ -419,6 +419,11 @@ def tensor_data(tensor: torch.Tensor) -> memoryview:
     Returns:
         A memoryview of the tensor data as uint8.
     """
+    # GPU tensors cannot be converted to numpy directly; move to CPU first.
+    # This is needed for GPU-resident decode pipelines (e.g.
+    # nvimagecodec_gpu_resident) that produce CUDA tensors.
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
     return tensor.flatten().contiguous().view(torch.uint8).numpy().data
 
 
