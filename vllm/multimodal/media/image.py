@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from io import BytesIO
+import os
 from pathlib import Path
+import threading
+import time
 
 import pybase64
 import torch
@@ -20,6 +23,12 @@ class ImageMediaIO(MediaIO[Image.Image]):
     by the runtime API field "media_io_kwargs". Ensure proper validation and
     error handling.
     """
+
+    _thread_local = threading.local()
+    _cache_first_result_enabled = bool(
+        int(os.getenv("VLLM_IMAGE_DECODE_CACHE_ENABLED", "0"))
+    )
+    _cache_sleep_ms = int(os.getenv("VLLM_IMAGE_DECODE_SLEEP_MS", "0"))
 
     def __init__(self, image_mode: str = "RGB", **kwargs) -> None:
         super().__init__()
