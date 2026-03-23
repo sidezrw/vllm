@@ -19,6 +19,11 @@ from .base import MediaIO, MediaWithBytes
 
 
 class ImageMediaIO(MediaIO[Image.Image]):
+    """Configuration values can be user-provided either by --media-io-kwargs or
+    by the runtime API field "media_io_kwargs". Ensure proper validation and
+    error handling.
+    """
+
     _thread_local = threading.local()
     _cache_first_result_enabled = bool(
         int(os.getenv("VLLM_IMAGE_DECODE_CACHE_ENABLED", "0"))
@@ -30,7 +35,8 @@ class ImageMediaIO(MediaIO[Image.Image]):
 
         self.image_mode = image_mode
         # `kwargs` contains custom arguments from
-        # --media-io-kwargs for this modality.
+        # --media-io-kwargs for this modality, merged with
+        # per-request runtime media_io_kwargs via merge_kwargs().
         # They can be passed to the underlying
         # media loaders (e.g. custom implementations)
         # for flexible control.
@@ -146,6 +152,13 @@ class ImageMediaIO(MediaIO[Image.Image]):
 
 
 class ImageEmbeddingMediaIO(MediaIO[torch.Tensor]):
+    """Image embedding MediaIO implementation.
+
+    Configuration values can be user-provided either by --media-io-kwargs or
+    by the runtime API field "media_io_kwargs". Ensure proper validation and
+    error handling.
+    """
+
     def __init__(self) -> None:
         super().__init__()
 

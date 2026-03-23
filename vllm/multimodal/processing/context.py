@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from abc import abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -274,13 +274,13 @@ class InputProcessingContext:
 
     def call_hf_processor(
         self,
-        hf_processor: ProcessorMixin,
+        hf_processor: Callable[..., BatchFeature] | ProcessorMixin,
         data: Mapping[str, object],
         kwargs: Mapping[str, object] = {},
         *,
         num_tries: int = 1,
         max_tries: int = 5,
-    ) -> BatchFeature | JSONTree:
+    ) -> BatchFeature:
         """
         Call `hf_processor` on the prompt `data`
         (text, image, audio...) with configurable options `kwargs`.
@@ -374,8 +374,7 @@ class InputProcessingContext:
             output_ = self._postprocess_output(output.data)
             if should_use_image_cache and output.get("pixel_values") is not None:
                 _set_cached_hf_output(output_)
-                # print("[hf_processor] cached first preprocessed image output")
-            return BatchFeature(output_)
+            return BatchFeature(output_)  # type: ignore
 
         logger.warning_once(
             "%s did not return `BatchFeature`. "
@@ -384,7 +383,7 @@ class InputProcessingContext:
             type(hf_processor).__name__,
         )
 
-        return self._postprocess_output(output)
+        return self._postprocess_output(output)  # type: ignore
 
 
 class BaseProcessingInfo:
