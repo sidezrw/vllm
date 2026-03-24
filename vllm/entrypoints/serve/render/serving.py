@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from http import HTTPStatus
 from typing import Any
 
@@ -24,7 +24,6 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     parse_chat_inputs_to_harmony_messages,
     render_for_completion,
 )
-from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.serve.disagg.protocol import (
     GenerateRequest,
     MultiModalFeatures,
@@ -45,6 +44,7 @@ from vllm.renderers.inputs.preprocess import (
     parse_model_prompt,
     prompt_to_seq,
 )
+from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.utils import random_uuid
 from vllm.utils.mistral import is_mistral_tokenizer
@@ -83,10 +83,12 @@ class OpenAIServingRender:
         self.trust_request_chat_template = trust_request_chat_template
         self.enable_auto_tools = enable_auto_tools
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
-        self.tool_parser: type[ToolParser] | None = ParserManager.get_tool_parser(
-            tool_parser_name=tool_parser,
-            enable_auto_tools=enable_auto_tools,
-            model_name=model_config.model,
+        self.tool_parser: Callable[[TokenizerLike], ToolParser] | None = (
+            ParserManager.get_tool_parser(
+                tool_parser_name=tool_parser,
+                enable_auto_tools=enable_auto_tools,
+                model_name=model_config.model,
+            )
         )
         self.default_chat_template_kwargs: dict[str, Any] = (
             default_chat_template_kwargs or {}
@@ -224,7 +226,7 @@ class OpenAIServingRender:
 
         if not self.use_harmony:
             # Common case.
-            error_check_ret = self.validate_chat_template(
+            error_check_ret = self._validate_chat_template(
                 request_chat_template=request.chat_template,
                 chat_template_kwargs=request.chat_template_kwargs,
                 trust_request_chat_template=self.trust_request_chat_template,
@@ -232,7 +234,7 @@ class OpenAIServingRender:
             if error_check_ret is not None:
                 return error_check_ret
 
-            conversation, engine_prompts = await self.preprocess_chat(
+            conversation, engine_prompts = await self._preprocess_chat(
                 request,
                 request.messages,
                 default_template=self.chat_template,
@@ -326,7 +328,7 @@ class OpenAIServingRender:
                 "prompt_logprobs is not compatible with prompt embeds."
             )
 
-        engine_prompts = await self.preprocess_completion(
+        engine_prompts = await self._preprocess_completion(
             request,
             prompt_input=request.prompt,
             prompt_embeds=request.prompt_embeds,
@@ -424,7 +426,7 @@ class OpenAIServingRender:
     ) -> ErrorResponse | None:
         return await self.model_registry.check_model(request.model)
 
-    def validate_chat_template(
+    def _validate_chat_template(
         self,
         request_chat_template: str | None,
         chat_template_kwargs: dict[str, Any] | None,
@@ -445,7 +447,7 @@ class OpenAIServingRender:
             )
         return None
 
-    async def preprocess_completion(
+    async def _preprocess_completion(
         self,
         request: Any,
         prompt_input: str | list[str] | list[int] | list[list[int]] | None,
@@ -457,9 +459,9 @@ class OpenAIServingRender:
             prompts.extend(prompt_to_seq(prompt_embeds))
         if prompt_input is not None:
             prompts.extend(prompt_to_seq(prompt_input))
-        return await self.preprocess_cmpl(request, prompts)
+        return await self._preprocess_cmpl(request, prompts)
 
-    async def preprocess_cmpl(
+    async def _preprocess_cmpl(
         self,
         request: Any,
         prompts: Sequence[PromptType | bytes],
@@ -488,7 +490,7 @@ class OpenAIServingRender:
             },
         )
 
-    async def preprocess_chat(
+    async def _preprocess_chat(
         self,
         request: Any,
         messages: list[Any],
@@ -496,9 +498,13 @@ class OpenAIServingRender:
         default_template_content_format: ChatTemplateContentFormatOption,
         default_template_kwargs: dict[str, Any] | None,
         tool_dicts: list[dict[str, Any]] | None = None,
-        tool_parser: type[ToolParser] | None = None,
+        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
     ) -> tuple[list[ConversationMessage], list[ProcessorInputs]]:
-        """Copied from OpenAIServing._preprocess_chat."""
+        """Copied from OpenAIServing._preprocess_chat.
+
+        Differences: isinstance check is ChatCompletionRequest-only
+        (ResponsesRequest not supported here); TODO comment dropped accordingly.
+        """
         renderer = self.renderer
         mm_config = self.model_config.multimodal_config
 
@@ -536,11 +542,11 @@ class OpenAIServingRender:
         if tool_parser is not None:
             tool_choice = getattr(request, "tool_choice", "none")
             if tool_choice != "none":
-                if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
+                if not isinstance(request, ChatCompletionRequest):
                     msg = (
                         "Tool usage is only supported "
-                        "for Chat Completions API or Responses API requests, "
-                        f"but got {type(request).__name__}"
+                        " for ChatCompletionRequest, but got "
+                        f"{type(request).__name__}"
                     )
                     raise NotImplementedError(msg)
                 tokenizer = renderer.get_tokenizer()

@@ -674,8 +674,7 @@ def serialize_vllm_model(
             key = f.read()
         encryption_params = EncryptionParams(key=key)
 
-    if (output_file := tensorizer_args.tensorizer_uri) is None:
-        raise ValueError("tensorizer_uri must be specified for serialization.")
+    output_file = tensorizer_args.tensorizer_uri
     if tensorizer_config._is_sharded:
         from vllm.distributed import get_tensor_model_parallel_rank
 

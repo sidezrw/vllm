@@ -172,6 +172,9 @@ class BaseRenderer(ABC, Generic[_T]):
 
         For chat requests:
         - Jinja2 template compilation
+
+        For multi-modal requests:
+        - Importing libraries such as librosa triggers JIT compilation.
         """
         from vllm.entrypoints.chat_utils import ChatTemplateResolutionError
 
@@ -697,20 +700,12 @@ class BaseRenderer(ABC, Generic[_T]):
         enc_prompt = prompt["encoder_prompt"]
         dec_prompt = prompt["decoder_prompt"]
 
-        skip_decoder_start_token = False
-        if self.mm_processor is not None:
-            from vllm.multimodal.processing import EncDecMultiModalProcessor
-
-            if isinstance(self.mm_processor, EncDecMultiModalProcessor):
-                skip_decoder_start_token = self.mm_processor.skip_decoder_start_token
-
         return build_enc_dec_inputs(
             encoder_inputs=self._process_singleton(enc_prompt),
             decoder_inputs=(
                 None if dec_prompt is None else self._process_singleton(dec_prompt)
             ),
             decoder_start_token_id=self.get_dec_start_token_id(),
-            skip_decoder_start_token=skip_decoder_start_token,
         )
 
     def process_for_engine(
@@ -763,7 +758,10 @@ class BaseRenderer(ABC, Generic[_T]):
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
-        return [self.process_for_engine(prompt, arrival_time) for prompt in tok_prompts]
+        return list(await asyncio.gather(*[
+            asyncio.to_thread(self.process_for_engine, prompt, arrival_time)
+            for prompt in tok_prompts
+        ]))
 
     def render_chat(
         self,
@@ -827,8 +825,9 @@ class BaseRenderer(ABC, Generic[_T]):
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
-        eng_prompts = [
-            self.process_for_engine(prompt, arrival_time) for prompt in tok_prompts
-        ]
+        eng_prompts = list(await asyncio.gather(*[
+            asyncio.to_thread(self.process_for_engine, prompt, arrival_time)
+            for prompt in tok_prompts
+        ]))
 
         return out_conversations, eng_prompts

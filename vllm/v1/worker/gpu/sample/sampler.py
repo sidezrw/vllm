@@ -178,4 +178,4 @@ class Sampler:
             pos,
             apply_temperature=False,
         )
-        return sampled, processed_logits
+        return sampled, logits

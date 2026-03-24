@@ -5,7 +5,7 @@
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class AnthropicError(BaseModel):
@@ -34,14 +34,7 @@ class AnthropicUsage(BaseModel):
 class AnthropicContentBlock(BaseModel):
     """Content block in message"""
 
-    type: Literal[
-        "text",
-        "image",
-        "tool_use",
-        "tool_result",
-        "thinking",
-        "redacted_thinking",
-    ]
+    type: Literal["text", "image", "tool_use", "tool_result", "thinking"]
     text: str | None = None
     # For image content
     source: dict[str, Any] | None = None
@@ -55,8 +48,6 @@ class AnthropicContentBlock(BaseModel):
     # For thinking content
     thinking: str | None = None
     signature: str | None = None
-    # For redacted thinking content (safety-filtered by the API)
-    data: str | None = None
 
 
 class AnthropicMessage(BaseModel):
@@ -111,12 +102,6 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
-
-    # vLLM-specific fields that are not in Anthropic spec
-    kv_transfer_params: dict[str, Any] | None = Field(
-        default=None,
-        description="KVTransfer parameters used for disaggregated serving.",
-    )
 
     @field_validator("model")
     @classmethod
@@ -186,11 +171,6 @@ class AnthropicMessagesResponse(BaseModel):
     ) = None
     stop_sequence: str | None = None
     usage: AnthropicUsage | None = None
-
-    # vLLM-specific fields that are not in Anthropic spec
-    kv_transfer_params: dict[str, Any] | None = Field(
-        default=None, description="KVTransfer parameters."
-    )
 
     def model_post_init(self, __context):
         if not self.id:

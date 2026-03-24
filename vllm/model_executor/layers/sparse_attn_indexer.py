@@ -96,7 +96,6 @@ def sparse_attn_indexer(
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
-        assert prefill_metadata is not None
 
         # Get the full shared workspace buffers once (will allocate on first use)
         workspace_manager = current_workspace_manager()
@@ -171,8 +170,6 @@ def sparse_attn_indexer(
 
     if has_decode:
         decode_metadata = attn_metadata.decode
-        assert decode_metadata is not None
-        # kv_cache shape [
         # kv_cache size requirement [num_block, block_size, n_head, head_dim],
         # we only have [num_block, block_size, head_dim],
         kv_cache = kv_cache.unsqueeze(-2)
@@ -368,7 +365,7 @@ class SparseAttnIndexer(CustomOp):
         return torch.ops.vllm.sparse_attn_indexer(
             hidden_states,
             self.k_cache.prefix,
-            self.k_cache.kv_cache,
+            self.k_cache.kv_cache[0],
             q_fp8,
             k,
             weights,
@@ -392,7 +389,7 @@ class SparseAttnIndexer(CustomOp):
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
                 self.k_cache.prefix,
-                self.k_cache.kv_cache,
+                self.k_cache.kv_cache[0],
                 q_fp8,
                 k,
                 weights,

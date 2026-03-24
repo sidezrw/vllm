@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
+    mxfp4_w4a16_moe_quant_config,
     nvfp4_moe_quant_config,
     nvfp4_w4a16_moe_quant_config,
 )
@@ -86,7 +87,7 @@ def backend_to_kernel_cls(
         return [FlashInferExperts]
 
     elif backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (  # noqa: E501
+        from vllm.model_executor.layers.fused_moe.flashinfer_cutedsl_moe import (
             FlashInferCuteDSLExperts,
         )
 
@@ -346,6 +347,16 @@ def convert_to_nvfp4_moe_kernel_format(
     )
 
 
+def make_mxfp4_moe_quant_config(
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> FusedMoEQuantConfig:
+    return mxfp4_w4a16_moe_quant_config(
+        w1_scale=w13_scale,
+        w2_scale=w2_scale,
+    )
+
+
 def make_nvfp4_moe_quant_config(
     backend: NvFp4MoeBackend,
     w13_scale: torch.Tensor,
@@ -363,13 +374,11 @@ def make_nvfp4_moe_quant_config(
             w2_scale=w2_scale,
         )
 
-    # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
-    # The expert's process_weights_after_loading will fuse activation
-    # scales in-place. Since the quant config references the same tensor
-    # as the registered parameter, EPLB rearrangement stays in sync.
+    g1_alphas = a13_scale * w13_scale_2
+    g2_alphas = a2_scale * w2_scale_2
     return nvfp4_moe_quant_config(
-        g1_alphas=w13_scale_2,
-        g2_alphas=w2_scale_2,
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
         a1_gscale=(1.0 / a13_scale),
         a2_gscale=(1.0 / a2_scale),
         w1_scale=w13_scale,

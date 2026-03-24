@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Generator
-from typing import TYPE_CHECKING, cast
 
 import gguf
 import regex as re
@@ -27,9 +26,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
 from vllm.utils.torch_utils import set_default_torch_dtype
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 
 logger = init_logger(__name__)
 
@@ -354,9 +350,10 @@ class GGUFModelLoader(BaseModelLoader):
             for name, weight_type in weight_type_map.items()
             if weight_type in ("F32", "F16", "BF16") and name.endswith(".weight")
         ]
-        logger.debug("GGUF unquantized modules: %s", unquant_names)
-        if TYPE_CHECKING:
-            vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
+        logger.debug(
+            "GGUF unquantized modules: %s",
+            unquant_names,
+        )
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
 
         target_device = torch.device(device_config.device)

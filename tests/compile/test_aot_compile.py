@@ -14,7 +14,6 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-import vllm.envs as envs
 import vllm.model_executor.layers.activation
 from vllm.compilation.backends import VllmBackend
 from vllm.compilation.caching import (
@@ -163,9 +162,6 @@ def test_save_and_load(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")
 def test_save_and_load_slice(monkeypatch: pytest.MonkeyPatch):
-    from torch._subclasses import FakeTensorMode
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
     def foo(x: torch.Tensor):
         return x[slice(0, x.shape[0])]
 
@@ -176,13 +172,12 @@ def test_save_and_load_slice(monkeypatch: pytest.MonkeyPatch):
     gm = torch.fx.symbolic_trace(foo)
     assert "getitem_1 = x[slice(0, getitem, None)]" in gm.code
     with use_vllm_config(vllm_config):
-        payload = VllmSerializableFunction.serialize_graph_module(gm)
-        fake_mode = FakeTensorMode(shape_env=ShapeEnv())
-        loaded_gm = VllmSerializableFunction.deserialize_graph_module(
-            payload, fake_mode
+        payload = VllmSerializableFunction.serialize_compile_artifacts(
+            VllmSerializableFunction(gm, (example_input,), "", foo)
         )
+        fn = VllmSerializableFunction.deserialize_compile_artifacts(payload)
 
-    assert gm.code == loaded_gm.code
+    assert gm.code == fn.graph_module.code
 
 
 @pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")
@@ -730,10 +725,6 @@ class TestStandaloneCompiledArtifactsIntegration:
         ]:
             assert cache.get(submod, shape) == shared_data
 
-    @pytest.mark.skipif(
-        envs.VLLM_USE_MEGA_AOT_ARTIFACT,
-        reason="There's no AOT Autograd run with mega artifact",
-    )
     def test_functorch_config(self):
         vllm_config = make_vllm_config()
         example_inputs = (torch.randn(10, 10),)

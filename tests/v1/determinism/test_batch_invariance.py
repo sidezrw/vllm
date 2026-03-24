@@ -8,14 +8,14 @@ import pytest
 import torch
 from utils import (
     BACKENDS,
-    TEST_MODEL,
     _extract_step_logprobs,
     _random_prompt,
     is_device_capability_below_90,
+    resolve_model_name,
     skip_unsupported,
 )
 
-import vllm.envs as envs
+import vllm.model_executor.layers.batch_invariant as batch_invariant
 from vllm import LLM, SamplingParams
 
 IS_DEVICE_CAPABILITY_BELOW_90 = is_device_capability_below_90()
@@ -57,7 +57,7 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
     attention_config = {"backend": backend}
     # Allow overrides from environment (useful for CI tuning)
     # "facebook/opt-125m" is too small, doesn't reliably test determinism
-    model = TEST_MODEL
+    model = resolve_model_name(backend)
     num_trials = int(os.getenv("VLLM_NEEDLE_TRIALS", "5"))
     max_batch_size = int(os.getenv("VLLM_NEEDLE_BATCH_SIZE", "128"))
     min_random_prompt = int(os.getenv("VLLM_MIN_PROMPT", "1024"))
@@ -169,13 +169,16 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
 ):
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
+    model_name = resolve_model_name(backend)
     tp_size = int(os.getenv("VLLM_TEST_TP_SIZE", "1"))
 
     # For batch invariance, disable custom all-reduce to ensure deterministic
     # all-reduce operations (custom all-reduce may not be deterministic)
-    import vllm.envs as envs
+    from vllm.model_executor.layers.batch_invariant import (
+        vllm_is_batch_invariant,
+    )
 
-    disable_custom_ar = envs.VLLM_BATCH_INVARIANT
+    disable_custom_ar = vllm_is_batch_invariant()
 
     if disable_custom_ar:
         print(f"\n{'=' * 80}")
@@ -183,7 +186,7 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
         print(f"{'=' * 80}\n")
 
     llm = LLM(
-        model=TEST_MODEL,
+        model=model_name,
         tensor_parallel_size=tp_size,
         max_num_seqs=128,
         max_model_len=8192,
@@ -392,7 +395,7 @@ def test_simple_generation(backend):
     Simple test that runs the model with a basic prompt and prints the output.
     Useful for quick smoke testing and debugging.
     """
-    model = TEST_MODEL
+    model = resolve_model_name(backend)
 
     llm = LLM(
         model=model,
@@ -452,9 +455,10 @@ def test_logprobs_without_batch_invariance_should_fail(
     """
     # CRITICAL: Disable batch invariance for this test
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(batch_invariant, "VLLM_BATCH_INVARIANT", False)
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
+    model_name = resolve_model_name(backend)
     tp_size = int(os.getenv("VLLM_TEST_TP_SIZE", "1"))
 
     print(f"\n{'=' * 80}")
@@ -462,7 +466,7 @@ def test_logprobs_without_batch_invariance_should_fail(
     print(f"{'=' * 80}\n")
 
     llm = LLM(
-        model=TEST_MODEL,
+        model=model_name,
         tensor_parallel_size=tp_size,
         max_num_seqs=32,
         max_model_len=8192,
@@ -670,11 +674,14 @@ def test_decode_logprobs_match_prefill_logprobs(
     """
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
+    model_name = resolve_model_name(backend)
     tp_size = int(os.getenv("VLLM_TEST_TP_SIZE", "1"))
 
-    import vllm.envs as envs
+    from vllm.model_executor.layers.batch_invariant import (
+        vllm_is_batch_invariant,
+    )
 
-    disable_custom_ar = envs.VLLM_BATCH_INVARIANT
+    disable_custom_ar = vllm_is_batch_invariant()
 
     if disable_custom_ar:
         print(f"\n{'=' * 80}")
@@ -682,7 +689,7 @@ def test_decode_logprobs_match_prefill_logprobs(
         print(f"{'=' * 80}\n")
 
     llm = LLM(
-        model=TEST_MODEL,
+        model=model_name,
         tensor_parallel_size=tp_size,
         max_num_seqs=32,
         max_model_len=8192,

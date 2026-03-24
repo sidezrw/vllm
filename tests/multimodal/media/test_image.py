@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from vllm.multimodal.image import IMAGE_LOADER_REGISTRY, ImageLoader
 from vllm.multimodal.media import ImageMediaIO
 
 pytestmark = pytest.mark.cpu_test
@@ -131,3 +132,127 @@ def test_image_media_io_rgba_background_color_validation():
     ImageMediaIO(rgba_background_color=(0, 0, 0))  # Should not raise
     ImageMediaIO(rgba_background_color=[255, 255, 255])  # Should not raise
     ImageMediaIO(rgba_background_color=(128, 128, 128))  # Should not raise
+
+
+FAKE_IMAGE_1 = Image.fromarray(np.full((8, 8, 3), 10, dtype=np.uint8))
+FAKE_IMAGE_2 = Image.fromarray(np.full((8, 8, 3), 20, dtype=np.uint8))
+
+
+@IMAGE_LOADER_REGISTRY.register("test_image_backend_override_1")
+class TestImageBackendOverride1(ImageLoader):
+    @classmethod
+    def load_bytes(cls, data: bytes, **kwargs) -> Image.Image:
+        return FAKE_IMAGE_1.copy()
+
+
+@IMAGE_LOADER_REGISTRY.register("test_image_backend_override_2")
+class TestImageBackendOverride2(ImageLoader):
+    @classmethod
+    def load_bytes(cls, data: bytes, **kwargs) -> Image.Image:
+        return FAKE_IMAGE_2.copy()
+
+
+@IMAGE_LOADER_REGISTRY.register("test_image_backend_ndarray")
+class TestImageBackendNdarray(ImageLoader):
+    @classmethod
+    def load_bytes(cls, data: bytes, **kwargs) -> np.ndarray:
+        return np.asarray(FAKE_IMAGE_2)
+
+
+def test_image_media_io_backend_kwarg_override(monkeypatch: pytest.MonkeyPatch):
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_IMAGE_LOADER_BACKEND", "test_image_backend_override_1")
+
+        imageio_default = ImageMediaIO()
+        image_default = imageio_default.load_bytes(b"test")
+        np.testing.assert_array_equal(np.asarray(image_default), np.asarray(FAKE_IMAGE_1))
+
+        imageio_override = ImageMediaIO(image_backend="test_image_backend_override_2")
+        image_override = imageio_override.load_bytes(b"test")
+        np.testing.assert_array_equal(np.asarray(image_override), np.asarray(FAKE_IMAGE_2))
+
+
+def test_image_media_io_backend_kwarg_not_passed_to_loader(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    @IMAGE_LOADER_REGISTRY.register("test_reject_image_backend_kwarg")
+    class RejectImageBackendKwargLoader(ImageLoader):
+        @classmethod
+        def load_bytes(cls, data: bytes, **kwargs) -> Image.Image:
+            if "image_backend" in kwargs:
+                raise AssertionError(
+                    "image_backend should be consumed by ImageMediaIO, "
+                    "not passed to loader"
+                )
+            if kwargs.get("other_kwarg") != "should_pass_through":
+                raise AssertionError("Expected other_kwarg to pass through")
+            return FAKE_IMAGE_1.copy()
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_IMAGE_LOADER_BACKEND", "test_reject_image_backend_kwarg")
+        imageio = ImageMediaIO(
+            image_backend="test_reject_image_backend_kwarg",
+            other_kwarg="should_pass_through",
+        )
+        image = imageio.load_bytes(b"test")
+        np.testing.assert_array_equal(np.asarray(image), np.asarray(FAKE_IMAGE_1))
+
+
+def test_image_media_io_backend_env_var_fallback(monkeypatch: pytest.MonkeyPatch):
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_IMAGE_LOADER_BACKEND", "test_image_backend_override_2")
+
+        imageio_none = ImageMediaIO(image_backend=None)
+        image_none = imageio_none.load_bytes(b"test")
+        np.testing.assert_array_equal(np.asarray(image_none), np.asarray(FAKE_IMAGE_2))
+
+        imageio_missing = ImageMediaIO()
+        image_missing = imageio_missing.load_bytes(b"test")
+        np.testing.assert_array_equal(np.asarray(image_missing), np.asarray(FAKE_IMAGE_2))
+
+
+def test_image_media_io_converts_ndarray_loader_output():
+    imageio = ImageMediaIO(image_backend="test_image_backend_ndarray")
+    image = imageio.load_bytes(b"test")
+    assert isinstance(image.media, Image.Image)
+    np.testing.assert_array_equal(np.asarray(image), np.asarray(FAKE_IMAGE_2))
+
+
+def test_image_media_io_default_backend_is_pil(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    with monkeypatch.context() as m:
+        m.delenv("VLLM_IMAGE_LOADER_BACKEND", raising=False)
+
+        raw = np.array(
+            [[[255, 0, 0], [0, 255, 0]], [[0, 0, 255], [255, 255, 0]]], dtype=np.uint8
+        )
+        image = Image.fromarray(raw, mode="RGB")
+        image_path = tmp_path / "test_default_pil.png"
+        image.save(image_path)
+        image_data = image_path.read_bytes()
+
+        imageio = ImageMediaIO()
+        decoded = imageio.load_bytes(image_data)
+        np.testing.assert_array_equal(np.asarray(decoded), raw)
+
+
+def test_image_media_io_default_backend_is_nvimagecodec_if_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    pytest.importorskip("nvidia.nvimgcodec")
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_IMAGE_LOADER_BACKEND", "nvimagecodec")
+
+        raw = np.array(
+            [[[255, 0, 0], [0, 255, 0]], [[0, 0, 255], [255, 255, 0]]], dtype=np.uint8
+        )
+        image = Image.fromarray(raw, mode="RGB")
+        image_path = tmp_path / "test_default_nvimagecodec.png"
+        image.save(image_path)
+        image_data = image_path.read_bytes()
+
+        imageio = ImageMediaIO()
+        decoded = imageio.load_bytes(image_data)
+        np.testing.assert_array_equal(np.asarray(decoded), raw)

@@ -346,7 +346,7 @@ class FusedMoEQuantConfig:
 
     @property
     def use_fp8_w8a8(self) -> bool:
-        return self.quant_dtype == current_platform.fp8_dtype()
+        return self.quant_dtype == torch.float8_e4m3fn
 
     @property
     def use_int8_w8a8(self) -> bool:
@@ -566,7 +566,7 @@ def fp8_w8a8_moe_quant_config(
     Construct a quant config for fp8 activations and fp8 weights.
     """
     return FusedMoEQuantConfig.make(
-        current_platform.fp8_dtype(),
+        torch.float8_e4m3fn,
         w1_scale=w1_scale,
         g1_alphas=g1_alphas,
         w2_scale=w2_scale,
@@ -957,17 +957,9 @@ class FusedMoEParallelConfig:
         return self.use_all2all_kernels and self.all2all_backend == "deepep_low_latency"
 
     @property
-    def use_fi_nvl_two_sided_kernels(self):
-        return self.use_all2all_kernels and (
-            self.all2all_backend == "flashinfer_all2allv"
-            or self.all2all_backend == "flashinfer_nvlink_two_sided"
-        )
-
-    @property
-    def use_fi_nvl_one_sided_kernels(self):
+    def use_fi_all2allv_kernels(self):
         return (
-            self.use_all2all_kernels
-            and self.all2all_backend == "flashinfer_nvlink_one_sided"
+            self.use_all2all_kernels and self.all2all_backend == "flashinfer_all2allv"
         )
 
     @property
@@ -975,10 +967,9 @@ class FusedMoEParallelConfig:
         return self.use_deepep_ll_kernels
 
     @property
-    def use_ag_rs_all2all_kernels(self):
-        return (
-            self.use_all2all_kernels
-            and self.all2all_backend == "allgather_reducescatter"
+    def use_naive_all2all_kernels(self):
+        return self.use_all2all_kernels and (
+            self.all2all_backend in ["naive", "allgather_reducescatter"]
         )
 
     @property
@@ -1144,7 +1135,7 @@ class FusedMoEParallelConfig:
             ep_rank=0,
             sp_size=1,
             use_ep=False,
-            all2all_backend="allgather_reducescatter",
+            all2all_backend="naive",
             enable_eplb=False,
         )
 
@@ -1249,16 +1240,12 @@ class FusedMoEConfig:
         return self.moe_parallel_config.use_mori_kernels
 
     @property
-    def use_fi_nvl_two_sided_kernels(self):
-        return self.moe_parallel_config.use_fi_nvl_two_sided_kernels
+    def use_fi_all2allv_kernels(self):
+        return self.moe_parallel_config.use_fi_all2allv_kernels
 
     @property
-    def use_fi_nvl_one_sided_kernels(self):
-        return self.moe_parallel_config.use_fi_nvl_one_sided_kernels
-
-    @property
-    def use_ag_rs_all2all_kernels(self):
-        return self.moe_parallel_config.use_ag_rs_all2all_kernels
+    def use_naive_all2all_kernels(self):
+        return self.moe_parallel_config.use_naive_all2all_kernels
 
     @property
     def use_nixl_ep_kernels(self):

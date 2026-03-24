@@ -231,14 +231,13 @@ def k2_server():
         "--gpu-memory-utilization",
         "0.4",
     ] + ROCM_EXTRA_ARGS
-    # Test kimi_k2 tool use tool_id format by overriding model_type.
-    # is_deepseek_mla safely returns False via getattr when kv_lora_rank
-    # is absent from the underlying config.
+    # hack to test kimi_k2 tool use tool_id format.
+    # avoid error in is_deepseek_mla check by setting kv_lora_rank=null
     with RemoteOpenAIServer(
         MODEL_NAME,
         args,
         env_dict=ROCM_ENV_OVERRIDES,
-        override_hf_configs={"model_type": "kimi_k2"},
+        override_hf_configs={"model_type": "kimi_k2", "kv_lora_rank": None},
     ) as remote_server:
         yield remote_server
 

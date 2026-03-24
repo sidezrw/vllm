@@ -38,6 +38,7 @@ from vllm.compilation.decorators import (
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import (
@@ -453,9 +454,7 @@ class Llama4UnfoldConvolution(nn.Module):
 
 
 @support_torch_compile(
-    dynamic_arg_dims={"images_flattened": 0},
-    enable_if=should_torch_compile_mm_encoder,
-    is_encoder=True,
+    dynamic_arg_dims={"images_flattened": 0}, enable_if=should_torch_compile_mm_encoder
 )
 class Llama4VisionModel(nn.Module):
     def __init__(
@@ -756,7 +755,12 @@ class Llama4ForConditionalGeneration(
         self.multimodal_config = multimodal_config
 
         with self._mark_tower_model(vllm_config, "image"):
-            with set_current_vllm_config(vllm_config):
+            from vllm.compilation.backends import set_model_tag
+
+            with (
+                set_current_vllm_config(vllm_config),
+                set_model_tag("Llama4VisionModel", is_encoder=True),
+            ):
                 self.vision_model = Llama4VisionModel(
                     config=config.vision_config,
                     quant_config=None,
@@ -868,7 +872,10 @@ class Llama4ForConditionalGeneration(
         if image_input is None:
             return []
 
-        return self._process_image_input(image_input)
+        with (
+            set_forward_context(None, self.vllm_config),
+        ):
+            return self._process_image_input(image_input)
 
     def forward(
         self,

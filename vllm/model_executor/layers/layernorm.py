@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import (
     rms_norm_batch_invariant,
+    vllm_is_batch_invariant,
 )
 from vllm.platforms import current_platform
 
@@ -56,7 +57,7 @@ def rms_norm(
 ) -> torch.Tensor:
     from vllm import _custom_ops as ops
 
-    if envs.VLLM_BATCH_INVARIANT:
+    if vllm_is_batch_invariant():
         return rms_norm_batch_invariant(x, weight, variance_epsilon)
     out = torch.empty_like(x)
     ops.rms_norm(
@@ -76,7 +77,7 @@ def fused_add_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm import _custom_ops as ops
 
-    if envs.VLLM_BATCH_INVARIANT:
+    if vllm_is_batch_invariant():
         return rms_norm_batch_invariant(
             x + residual, weight, variance_epsilon
         ), x + residual
@@ -299,7 +300,7 @@ class RMSNorm(CustomOp):
             and x.is_cuda
             and x.dim() >= 2
             and self.has_weight
-            and not envs.VLLM_BATCH_INVARIANT
+            and not vllm_is_batch_invariant()
             and self.weight.data.dtype == x.dtype
             and self.weight.data.is_contiguous()
         ):
@@ -327,7 +328,7 @@ class RMSNorm(CustomOp):
             and x.dtype == residual.dtype
             and x.dim() >= 2
             and self.has_weight
-            and not envs.VLLM_BATCH_INVARIANT
+            and not vllm_is_batch_invariant()
             and self.weight.data.dtype == x.dtype
             and self.weight.data.is_contiguous()
         ):

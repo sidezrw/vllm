@@ -9,15 +9,10 @@ then runs in the parent with clean in-memory state but populated caches.
 
 import multiprocessing as mp
 
-import pytest
 from torch._dynamo.utils import counters
 
-import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
-from vllm.utils.torch_utils import is_torch_equal_or_newer
-
-from ..utils import fork_new_process_for_each_test
 
 MODEL = "microsoft/Phi-tiny-MoE-instruct"
 
@@ -50,11 +45,8 @@ def _cold_start(vllm_runner):
     assert counters["aot_autograd"]["autograd_cache_hit"] == 0
 
 
-@fork_new_process_for_each_test
-@pytest.mark.parametrize("mega_aot_artifact", ["0", "1"])
-def test_moe_startup(monkeypatch, vllm_runner, fresh_vllm_cache, mega_aot_artifact):
+def test_moe_startup(monkeypatch, vllm_runner, fresh_vllm_cache):
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    monkeypatch.setenv("VLLM_USE_MEGA_AOT_ARTIFACT", mega_aot_artifact)
 
     # Cold start in a forked child (must fork before CUDA init).
     # This model has 32 identical transformer layers which produce
@@ -72,15 +64,7 @@ def test_moe_startup(monkeypatch, vllm_runner, fresh_vllm_cache, mega_aot_artifa
         num_compiled_artifacts_saved=0,
     ):
         _run_vllm(vllm_runner)
-    mega_aot_active = envs.VLLM_USE_MEGA_AOT_ARTIFACT and is_torch_equal_or_newer(
-        "2.10.0"
-    )
-    if mega_aot_active:
-        # MEGA_AOT_ARTIFACT is enabled, so we expect no aot_autograd running on
-        # subgraphs.
-        assert counters["aot_autograd"]["total"] == 0
-    else:
-        assert counters["aot_autograd"]["total"] == 30
+    assert counters["aot_autograd"]["total"] == 30
     assert counters["aot_autograd"]["autograd_cache_miss"] == 0
     assert (
         counters["aot_autograd"]["autograd_cache_hit"] == 0

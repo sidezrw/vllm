@@ -46,15 +46,14 @@ def query_marlin_supported_quant_types(
     if current_platform.is_cpu():
         return _query_cpu_marlin_supported_quant_types(has_zp, include_fp_type)
 
-    if not current_platform.is_rocm():
-        if device_capability is None:
-            capability_tuple = current_platform.get_device_capability()
-            device_capability = (
-                -1 if capability_tuple is None else capability_tuple.to_int()
-            )
+    if device_capability is None:
+        capability_tuple = current_platform.get_device_capability()
+        device_capability = (
+            -1 if capability_tuple is None else capability_tuple.to_int()
+        )
 
-        if device_capability < 75:
-            return []
+    if device_capability < 75:
+        return []
 
     # - has_zp is True: return quant_types that has zero points
     # - has_zp is False: return quant_types that has not zero points
@@ -211,6 +210,8 @@ def check_marlin_supports_shape(
 
 
 def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+    if current_platform.is_rocm():
+        return False
     output_size_per_partition = (
         getattr(layer, "output_size_per_partition", None) or layer.output_size
     )
