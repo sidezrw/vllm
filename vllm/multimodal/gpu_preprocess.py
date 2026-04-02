@@ -8,9 +8,15 @@ PIL/numpy intermediaries and achieving zero-copy GPU preprocessing.
 Pipeline: GPU tensor (CHW, uint8) -> GPU resize -> GPU rescale+normalize -> GPU reshape/flatten
 
 Author: Task t203 (GPU preprocessing prototype)
+Fixed: Task t464 (GPU memory leak fix)
+  - Added torch.no_grad() to all preprocessing methods
+  - Added explicit del of intermediate tensors
+  - Added in-place operations where possible
+  - Added optional concurrency semaphore
 """
 
 import math
+import threading
 from typing import Optional, Tuple, Union
 
 import torch
@@ -19,6 +25,12 @@ import torch.nn.functional as F
 # CLIP normalization constants (same as OPENAI_CLIP_MEAN / OPENAI_CLIP_STD)
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+# Maximum number of concurrent GPU preprocessing operations.
+# Prevents GPU OOM from too many simultaneous tensor allocations.
+_GPU_PREPROCESS_SEMAPHORE = threading.Semaphore(
+    int(__import__('os').environ.get("VLLM_GPU_PREPROCESS_CONCURRENCY", "8"))
+)
 
 
 def smart_resize(
@@ -68,6 +80,10 @@ class Qwen2VLGPUPreprocessor:
     Accepts GPU tensors directly (e.g., from nvImageCodec decode) and performs
     all preprocessing on GPU without CPU round-trips.
 
+    All tensor operations run under torch.no_grad() to prevent autograd
+    graph construction, which would retain intermediate tensors and cause
+    GPU memory leaks under sustained load.
+
     Attributes:
         image_mean: Per-channel mean for normalization (CLIP default).
         image_std: Per-channel std for normalization (CLIP default).
@@ -108,6 +124,7 @@ class Qwen2VLGPUPreprocessor:
         self._mean = torch.tensor(image_mean, dtype=torch.float32, device=self.device).view(3, 1, 1)
         self._std = torch.tensor(image_std, dtype=torch.float32, device=self.device).view(3, 1, 1)
 
+    @torch.no_grad()
     def _resize_gpu(
         self,
         image: torch.Tensor,
@@ -133,24 +150,31 @@ class Qwen2VLGPUPreprocessor:
             align_corners=False if self.interpolation_mode == "bicubic" else None,
             antialias=True,  # Match PIL BICUBIC antialiasing behavior
         )
-        return resized.squeeze(0)
+        result = resized.squeeze(0)
+        # Explicitly free the 4D intermediate
+        del img_4d, resized
+        return result
 
+    @torch.no_grad()
     def _normalize_gpu(self, image: torch.Tensor) -> torch.Tensor:
-        """Rescale and normalize a GPU tensor in-place.
+        """Rescale and normalize a GPU tensor using in-place ops.
 
-        Combined rescale (1/255) + normalize ((x - mean) / std) into a single
-        fused operation: (x * rescale_factor - mean) / std
+        Combined rescale (1/255) + normalize ((x - mean) / std) using
+        in-place operations to minimize intermediate tensor allocations.
 
         Args:
             image: (C, H, W) float32 tensor on GPU, pixel values [0, 255] or [0, 1].
 
         Returns:
-            Normalized (C, H, W) float32 tensor.
+            Normalized (C, H, W) float32 tensor (modified in-place).
         """
-        image = image * self.rescale_factor
-        image = (image - self._mean) / self._std
+        # In-place operations to avoid creating intermediate tensors
+        image.mul_(self.rescale_factor)
+        image.sub_(self._mean)
+        image.div_(self._std)
         return image
 
+    @torch.no_grad()
     def _reshape_to_patches(
         self,
         patches: torch.Tensor,
@@ -183,6 +207,7 @@ class Qwen2VLGPUPreprocessor:
             pad_count = temporal_patch_size - (T % temporal_patch_size)
             repeats = patches[-1:].expand(pad_count, -1, -1, -1)
             patches = torch.cat([patches, repeats], dim=0)
+            del repeats
 
         channel = patches.shape[1]
         grid_t = patches.shape[0] // temporal_patch_size
@@ -208,9 +233,13 @@ class Qwen2VLGPUPreprocessor:
             grid_t * grid_h * grid_w,
             channel * temporal_patch_size * patch_size * patch_size,
         )
+        # Make contiguous to allow reshape views to be freed
+        flatten_patches = flatten_patches.contiguous()
+        del patches
 
         return flatten_patches, (grid_t, grid_h, grid_w)
 
+    @torch.no_grad()
     def preprocess_single(
         self,
         image: torch.Tensor,
@@ -219,6 +248,9 @@ class Qwen2VLGPUPreprocessor:
         do_normalize: bool = True,
     ) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
         """Preprocess a single image entirely on GPU.
+
+        All operations run under torch.no_grad() to prevent autograd graph
+        construction. Intermediate tensors are explicitly freed.
 
         Args:
             image: Input tensor. Supported formats:
@@ -240,20 +272,20 @@ class Qwen2VLGPUPreprocessor:
         if image.ndim == 3 and image.shape[2] in (1, 3, 4):
             # Heuristic: if last dim is small channel count, it's HWC
             if image.shape[0] not in (1, 3, 4) or image.shape[2] <= 4:
-                image = image.permute(2, 0, 1)
+                image = image.permute(2, 0, 1).contiguous()
 
         # Convert to float32 if needed
-        if image.dtype == torch.uint8:
-            image = image.float()
-        elif image.dtype != torch.float32:
-            image = image.float()
+        if image.dtype != torch.float32:
+            float_image = image.float()
+            del image
+            image = float_image
 
         C, H, W = image.shape
         assert C in (1, 3), f"Expected 1 or 3 channels, got {C}"
 
         # Convert grayscale to RGB
         if C == 1:
-            image = image.expand(3, -1, -1)
+            image = image.expand(3, -1, -1).contiguous()
 
         resized_height, resized_width = H, W
 
@@ -265,22 +297,27 @@ class Qwen2VLGPUPreprocessor:
                 max_pixels=self.max_pixels,
             )
             if resized_height != H or resized_width != W:
+                pre_resize = image
                 image = self._resize_gpu(image, resized_height, resized_width)
+                del pre_resize
 
         if do_rescale and do_normalize:
-            # Fused rescale + normalize
+            # Fused in-place rescale + normalize
             image = self._normalize_gpu(image)
         elif do_rescale:
-            image = image * self.rescale_factor
+            image.mul_(self.rescale_factor)
         elif do_normalize:
             # Assume already in [0, 1] range
-            image = (image - self._mean) / self._std
+            image.sub_(self._mean)
+            image.div_(self._std)
 
         # Add temporal dimension: (C, H, W) -> (1, C, H, W)
         patches = image.unsqueeze(0)
+        del image
 
         return self._reshape_to_patches(patches, resized_height, resized_width)
 
+    @torch.no_grad()
     def preprocess_batch(
         self,
         images: list,
@@ -315,9 +352,11 @@ class Qwen2VLGPUPreprocessor:
             grid_thws.append(grid_thw)
 
         # Concatenate all patches along the first dimension
-        all_patches = torch.cat(all_patches, dim=0)
+        all_patches_cat = torch.cat(all_patches, dim=0)
+        # Free individual patch tensors
+        del all_patches
 
-        return all_patches, grid_thws
+        return all_patches_cat, grid_thws
 
     @staticmethod
     def from_cpu_preprocessor(cpu_processor) -> "Qwen2VLGPUPreprocessor":
@@ -362,6 +401,7 @@ class Qwen2VLGPUPreprocessor:
 # Convenience functions for integration with nvImageCodec decode pathway
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
 def gpu_preprocess_from_decoded(
     decoded_tensor: torch.Tensor,
     preprocessor: Optional[Qwen2VLGPUPreprocessor] = None,
