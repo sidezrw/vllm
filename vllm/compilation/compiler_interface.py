@@ -373,10 +373,16 @@ class InductorStandaloneAdaptor(CompilerInterface):
                 break
 
         if input_fake_mode is not None:
-            fake_mode_ctx: Any = patch(
-                "torch._inductor.standalone_compile.FakeTensorMode",
-                lambda *a, **kw: input_fake_mode,
-            )
+            # Guard: only patch if standalone_compile module actually has
+            # FakeTensorMode (varies by PyTorch version).
+            import torch._inductor.standalone_compile as _sc_mod
+            if hasattr(_sc_mod, "FakeTensorMode"):
+                fake_mode_ctx: Any = patch(
+                    "torch._inductor.standalone_compile.FakeTensorMode",
+                    lambda *a, **kw: input_fake_mode,
+                )
+            else:
+                fake_mode_ctx = contextlib.nullcontext()
         else:
             fake_mode_ctx = contextlib.nullcontext()
 
