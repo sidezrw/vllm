@@ -1012,9 +1012,16 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
 
         if all_patches:
             hf_output["pixel_values"] = torch.cat(all_patches, dim=0)
+            # Free individual patch tensors after concatenation
+            del all_patches
             hf_output["image_grid_thw"] = torch.tensor(
                 all_grid_thw, dtype=torch.int64
             )
+
+        # Explicitly free decoded GPU image tensors (t465: prevent
+        # input tensors from lingering when caller holds the list)
+        for i in range(len(gpu_images)):
+            gpu_images[i] = None
 
         return hf_output
 

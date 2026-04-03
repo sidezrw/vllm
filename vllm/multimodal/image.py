@@ -172,14 +172,18 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
         stream_a.synchronize()
 
         results = []
-        for decoded in decoded_list:
+        for i, decoded in enumerate(decoded_list):
             if decoded is None:
                 raise ValueError(
                     "nvimagecodec GPU-resident batch decode failed."
                 )
             gpu_tensor = torch.from_dlpack(decoded).clone()
             results.append(gpu_tensor)
+            # Free nvimgcodec buffer reference (t465: prevent decoder
+            # buffers from being held via the decoded_list)
+            decoded_list[i] = None
 
+        del decoded_list
         return results
 
     @classmethod
