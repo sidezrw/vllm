@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections import UserDict
 from collections.abc import Callable, Hashable, Iterator, KeysView, Mapping
 from types import MappingProxyType
@@ -53,6 +54,7 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
         super().__init__(capacity, getsizeof)
 
         self.pinned_items = set[_K]()
+        self._lock = threading.Lock()
 
         self._hits = 0
         self._total = 0
@@ -118,10 +120,11 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
         return info
 
     def touch(self, key: _K) -> None:
-        try:
-            self._LRUCache__order.move_to_end(key)  # type: ignore
-        except KeyError:
-            self._LRUCache__order[key] = None  # type: ignore
+        with self._lock:
+            try:
+                self._LRUCache__order.move_to_end(key)  # type: ignore
+            except KeyError:
+                self._LRUCache__order[key] = None  # type: ignore
 
     @overload
     def get(self, key: _K, /) -> _V | None: ...
@@ -189,21 +192,31 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
             self.remove_oldest()
 
     def popitem(self, remove_pinned: bool = False):
-        """Remove and return the `(key, value)` pair least recently used."""
-        if not remove_pinned:
-            # pop the oldest item in the cache that is not pinned
-            lru_key = next(
-                (key for key in self.order if key not in self.pinned_items),
-                ALL_PINNED_SENTINEL,
-            )
-            if lru_key is ALL_PINNED_SENTINEL:
-                raise RuntimeError(
-                    "All items are pinned, cannot remove oldest from the cache."
+        """Remove and return the `(key, value)` pair least recently used.
+
+        Thread-safe: guards OrderedDict iteration against concurrent mutation
+        from other threads inserting/removing cache entries.
+        """
+        with self._lock:
+            if not remove_pinned:
+                # pop the oldest item in the cache that is not pinned
+                # snapshot the order keys to avoid mutation during iteration
+                lru_key = next(
+                    (
+                        key
+                        for key in list(self.order)
+                        if key not in self.pinned_items
+                    ),
+                    ALL_PINNED_SENTINEL,
                 )
-        else:
-            lru_key = next(iter(self.order))
-        value = self.pop(cast(_K, lru_key))
-        return (lru_key, value)
+                if lru_key is ALL_PINNED_SENTINEL:
+                    raise RuntimeError(
+                        "All items are pinned, cannot remove oldest from the cache."
+                    )
+            else:
+                lru_key = next(iter(self.order))
+            value = self.pop(cast(_K, lru_key))
+            return (lru_key, value)
 
     def clear(self) -> None:
         while len(self) > 0:

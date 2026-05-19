@@ -83,6 +83,15 @@ class MultiModalHasher:
 
             return cls.iter_item_to_bytes("image", obj.original_bytes)
 
+        if isinstance(obj, MediaWithBytes):
+            # Non-PIL MediaWithBytes (e.g. nvimagecodec returning ndarray).
+            # Hash from the original encoded bytes when available — fast and
+            # deterministic regardless of the decoded media type.
+            if obj.original_bytes:
+                return cls.iter_item_to_bytes("image", obj.original_bytes)
+            # Fallback: serialize the inner media object directly.
+            return cls.serialize_item(obj.media)
+
         if isinstance(obj, torch.Tensor):
             tensor_obj: torch.Tensor = obj.cpu()
             tensor_dtype = tensor_obj.dtype

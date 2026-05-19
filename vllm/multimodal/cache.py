@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import operator
+import os
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -37,6 +39,90 @@ if TYPE_CHECKING:
     from .processing.processor import ResolvedPromptUpdate
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# GPU tensor offloading for processor cache (t465 fix)
+#
+# When caching preprocessed multimodal items, GPU tensors must be moved
+# to CPU before storage to avoid holding CUDA memory in the LRU cache.
+# On cache hit, tensors are moved back to GPU.  This eliminates the
+# primary source of unbounded GPU memory growth during long-running
+# inference (e.g., MLPerf 48K-image runs).
+# ---------------------------------------------------------------------------
+
+# Environment variable to disable offloading (for debugging only).
+_CACHE_OFFLOAD_DISABLED = os.environ.get(
+    "VLLM_MM_CACHE_NO_OFFLOAD", "0"
+).lower() in ("1", "true", "yes")
+
+# Counter for periodic empty_cache calls during evictions
+_eviction_counter = 0
+_EVICTION_EMPTY_CACHE_INTERVAL = int(
+    os.environ.get("VLLM_MM_CACHE_EMPTY_INTERVAL", "64")
+)
+
+
+def _offload_nested_tensors_to_cpu(data):
+    """Recursively move GPU tensors to CPU within a NestedTensors structure."""
+    if isinstance(data, torch.Tensor):
+        if data.is_cuda:
+            return data.to("cpu", non_blocking=True)
+        return data
+    elif isinstance(data, (list, tuple)):
+        converted = [_offload_nested_tensors_to_cpu(item) for item in data]
+        return type(data)(converted) if isinstance(data, tuple) else converted
+    else:
+        return data
+
+
+def _restore_nested_tensors_to_gpu(data, device=None):
+    """Recursively move CPU tensors back to GPU."""
+    if device is None:
+        device = torch.device("cuda")
+    if isinstance(data, torch.Tensor):
+        if data.device.type == "cpu":
+            return data.to(device, non_blocking=True)
+        return data
+    elif isinstance(data, (list, tuple)):
+        converted = [
+            _restore_nested_tensors_to_gpu(item, device) for item in data
+        ]
+        return type(data)(converted) if isinstance(data, tuple) else converted
+    else:
+        return data
+
+
+def _offload_kwargs_item_to_cpu(item: "MultiModalKwargsItem"):
+    """Move all GPU tensors in a MultiModalKwargsItem to CPU (in-place)."""
+    if _CACHE_OFFLOAD_DISABLED:
+        return
+    for key, elem in item.items():
+        elem.data = _offload_nested_tensors_to_cpu(elem.data)
+
+
+def _restore_kwargs_item_to_gpu(item: "MultiModalKwargsItem"):
+    """Move all CPU tensors in a MultiModalKwargsItem back to GPU."""
+    if _CACHE_OFFLOAD_DISABLED:
+        return item
+    # Build a new item so the cached copy stays on CPU
+    from copy import copy
+
+    new_item = MultiModalKwargsItem()
+    for key, elem in item.items():
+        new_elem = copy(elem)
+        new_elem.data = _restore_nested_tensors_to_gpu(elem.data)
+        new_item[key] = new_elem
+    return new_item
+
+
+def _maybe_empty_cuda_cache():
+    """Periodically call torch.cuda.empty_cache() to release fragmented memory."""
+    global _eviction_counter
+    _eviction_counter += 1
+    if _eviction_counter >= _EVICTION_EMPTY_CACHE_INTERVAL:
+        _eviction_counter = 0
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class MultiModalProcessorCacheItem:
@@ -332,6 +418,12 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
     - If the item is in the cache, replace the input with the cached item.
     - If the item is not in the cache, store that item (which includes
       tensor data and metadata) into the cache, and return the input.
+
+    GPU tensor offloading (t465): Before storing items in the cache,
+    GPU tensors are moved to CPU to prevent the LRU cache from holding
+    CUDA memory.  On cache hit, tensors are restored to GPU.  Cache
+    evictions periodically trigger torch.cuda.empty_cache() to release
+    fragmented CUDA memory.
     """
 
     def __init__(self, model_config: "ModelConfig") -> None:
@@ -343,6 +435,14 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
             mm_config.mm_processor_cache_gb,
             MultiModalProcessorCacheItem,
         )
+        # Hook into cache evictions to free CUDA memory
+        original_on_remove = self._cache._on_remove
+
+        def _on_remove_with_cuda_cleanup(key, value):
+            original_on_remove(key, value)
+            _maybe_empty_cuda_cache()
+
+        self._cache._on_remove = _on_remove_with_cuda_cleanup
 
     @override
     def is_cached_item(self, mm_hash: str) -> bool:
@@ -355,13 +455,25 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
         mm_hash: str,
     ) -> MultiModalProcessorCacheOutItem:
         if (cached_item := self._cache.get(mm_hash)) is not None:
-            return cached_item.item, cached_item.prompt_updates
+            # Restore GPU tensors from CPU-cached copy
+            restored_item = _restore_kwargs_item_to_gpu(cached_item.item)
+            return restored_item, cached_item.prompt_updates
 
         assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
 
-        self._cache[mm_hash] = MultiModalProcessorCacheItem(*mm_item)
+        kwargs_item, prompt_updates = mm_item
 
-        return mm_item
+        # Offload GPU tensors to CPU before storing in cache
+        _offload_kwargs_item_to_cpu(kwargs_item)
+        self._cache[mm_hash] = MultiModalProcessorCacheItem(
+            kwargs_item, prompt_updates
+        )
+
+        # Return original item (now on CPU) — caller may need GPU copy
+        # We return a GPU-restored copy so the processing pipeline
+        # continues to work with GPU tensors
+        restored_item = _restore_kwargs_item_to_gpu(kwargs_item)
+        return restored_item, prompt_updates
 
     @override
     def touch_sender_cache_item(self, mm_hash: str) -> None:
@@ -370,6 +482,8 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
     @override
     def clear_cache(self) -> None:
         self._cache.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @override
     def make_stats(self, *, delta: bool = False) -> CacheInfo:
