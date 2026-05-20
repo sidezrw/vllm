@@ -1203,6 +1203,7 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
 
 class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):
     _gpu_preprocessor = None
+    _gpu_path_logged = False
 
     def _get_gpu_preprocessor(self):
         """Lazy-init GPU preprocessor from HF image processor config."""
@@ -1218,7 +1219,19 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                         image_processor
                     )
                 )
-            except Exception:
+                print(
+                    "[Qwen3VLMultiModalProcessor] Qwen2VLGPUPreprocessor "
+                    "initialized — gpu_preprocess path active",
+                    flush=True,
+                )
+            except Exception as e:
+                import traceback
+                print(
+                    "[Qwen3VLMultiModalProcessor] gpu_preprocess INIT "
+                    f"FAILED: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+                traceback.print_exc()
                 self._gpu_preprocessor = False
         return self._gpu_preprocessor if self._gpu_preprocessor else None
 
@@ -1419,6 +1432,14 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         if gpu_images and not cpu_images:
             gpu_proc = self._get_gpu_preprocessor()
             if gpu_proc is not None:
+                if not type(self)._gpu_path_logged:
+                    type(self)._gpu_path_logged = True
+                    print(
+                        "[Qwen3VLMultiModalProcessor] dispatching first "
+                        "request through GPU preprocess path "
+                        f"(gpu_images={len(gpu_images)})",
+                        flush=True,
+                    )
                 processed_outputs = self._gpu_preprocess_call(
                     prompt,
                     gpu_images,

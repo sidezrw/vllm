@@ -114,14 +114,21 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
     _thread_local = threading.local()
     _batch_lock = threading.Lock()
     _pending_items: list[tuple[bytes, threading.Event, list]] = []
-    _batch_size = int(os.environ.get("VLLM_NVIMGCODEC_BATCH_SIZE", "128"))
+    # batch_size/timeout defaults tuned for the v0.21 inner-loop pass on H100
+    # fast profile: smaller batches + sub-ms wait beat the original 128/10ms
+    # values when the upstream rate is well below the batch fill rate (offline
+    # mode + max_num_seqs=1024 ⇒ requests arrive in bursts but the per-image
+    # decode wait dominated at the prior 10ms timeout). Override via env var
+    # at the docker run boundary for sweep experiments.
+    _batch_size = int(os.environ.get("VLLM_NVIMGCODEC_BATCH_SIZE", "8"))
     _batch_timeout_s = (
-        int(os.environ.get("VLLM_NVIMGCODEC_BATCH_TIMEOUT_MS", "10"))
+        int(os.environ.get("VLLM_NVIMGCODEC_BATCH_TIMEOUT_MS", "1"))
         / 1000.0
     )
     _gpu_resident = os.environ.get(
         "VLLM_NVIMGCODEC_GPU_RESIDENT", "1"
     ).lower() in ("1", "true", "yes")
+    _logged_once = False
 
     @classmethod
     def _get_decoder(cls):
@@ -188,6 +195,14 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
     @classmethod
     def load_bytes(cls, data: bytes, **kwargs):
         """Submit a single image for batch decode."""
+        if not cls._logged_once:
+            cls._logged_once = True
+            print(
+                "[NVImageCodecGPUResidentLoader] active: "
+                f"backend=nvimagecodec_gpu_resident batch_size={cls._batch_size} "
+                f"gpu_resident={cls._gpu_resident}",
+                flush=True,
+            )
         try:
             done_event = threading.Event()
             result_holder: list = []

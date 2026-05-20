@@ -9,9 +9,10 @@ import pybase64
 import torch
 from PIL import Image
 
+from vllm import envs
 from vllm.utils.serial_utils import tensor2base64
 
-from ..image import convert_image_mode, rgba_to_rgb
+from ..image import IMAGE_LOADER_REGISTRY, convert_image_mode, rgba_to_rgb
 from .base import MediaIO, MediaWithBytes
 
 MAGIC_NUMPY_PREFIX = b"\x93NUMPY"  # https://numpy.org/devdocs/reference/generated/numpy.lib.format.html#format-version-1-0
@@ -33,7 +34,11 @@ class ImageMediaIO(MediaIO[Image.Image]):
         # They can be passed to the underlying
         # media loaders (e.g. custom implementations)
         # for flexible control.
+        image_loader_backend = (
+            kwargs.pop("image_backend", None) or envs.VLLM_IMAGE_LOADER_BACKEND
+        )
         self.kwargs = kwargs
+        self.image_loader = IMAGE_LOADER_REGISTRY.load(image_loader_backend)
 
         # Extract RGBA background color from kwargs if provided
         # Default to white background for backward compatibility
@@ -54,6 +59,19 @@ class ImageMediaIO(MediaIO[Image.Image]):
             )
         self.rgba_background_color = rgba_bg
 
+    def _to_pil_image(self, image: Image.Image | object) -> Image.Image:
+        if isinstance(image, Image.Image):
+            return image
+        if isinstance(image, torch.Tensor):
+            if image.is_cuda:
+                image = image.cpu()
+            return Image.fromarray(image.numpy())
+        if hasattr(image, "__array_interface__"):
+            return Image.fromarray(image)
+        if isinstance(image, np.ndarray):
+            return Image.fromarray(image)
+        raise TypeError(f"Unsupported image type: {type(image)!r}")
+
     def _convert_image_mode(
         self, image: Image.Image | MediaWithBytes[Image.Image]
     ) -> Image.Image:
@@ -67,10 +85,26 @@ class ImageMediaIO(MediaIO[Image.Image]):
         else:
             return convert_image_mode(image, self.image_mode)
 
-    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
+    def load_bytes(
+        self, data: bytes
+    ) -> MediaWithBytes[Image.Image] | torch.Tensor:
+        image = self.image_loader.load_bytes(data, **self.kwargs)
+        # GPU-resident loaders return torch.Tensor on CUDA — pass through
+        # without PIL conversion to preserve zero-copy GPU decode path.
+        if isinstance(image, torch.Tensor) and image.is_cuda:
+            return image
+        # PIL bypass: if backend returned an ndarray that is already in the
+        # target mode (3-channel for RGB), skip the expensive PIL round-trip.
+        if (
+            hasattr(image, "__array_interface__")
+            and self.image_mode == "RGB"
+            and hasattr(image, "ndim")
+            and image.ndim == 3
+            and image.shape[2] == 3
+        ):
+            return MediaWithBytes(image, data)
         try:
-            image = Image.open(BytesIO(data))
-            image.load()
+            image = self._to_pil_image(image)
             image = self._convert_image_mode(image)
         except (OSError, Image.UnidentifiedImageError) as e:
             raise ValueError(f"Failed to load image: {e}") from e

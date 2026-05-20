@@ -372,13 +372,17 @@ class Qwen2VLGPUPreprocessor:
         Returns:
             Configured Qwen2VLGPUPreprocessor matching the CPU processor's settings.
         """
-        # Qwen3-VL stores pixel limits in size dict, not as direct attributes
-        min_pixels = cpu_processor.min_pixels
-        max_pixels = cpu_processor.max_pixels
-        if min_pixels is None and hasattr(cpu_processor, 'size'):
-            min_pixels = cpu_processor.size.get("shortest_edge")
-        if max_pixels is None and hasattr(cpu_processor, 'size'):
-            max_pixels = cpu_processor.size.get("longest_edge")
+        # Qwen3-VL stores pixel limits in size dict, not as direct attributes.
+        # In some transformers versions Qwen2VLImageProcessor.min_pixels/max_pixels
+        # are removed entirely (raises AttributeError on direct access), so use
+        # getattr so we cleanly fall through to the size dict.
+        min_pixels = getattr(cpu_processor, "min_pixels", None)
+        max_pixels = getattr(cpu_processor, "max_pixels", None)
+        size = getattr(cpu_processor, "size", None)
+        if min_pixels is None and size is not None:
+            min_pixels = size.get("shortest_edge") if hasattr(size, "get") else getattr(size, "shortest_edge", None)
+        if max_pixels is None and size is not None:
+            max_pixels = size.get("longest_edge") if hasattr(size, "get") else getattr(size, "longest_edge", None)
         # Final fallback to Qwen2-VL defaults
         if min_pixels is None:
             min_pixels = 56 * 56
