@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_MEDIA_URL_ALLOW_REDIRECTS: bool = True
     VLLM_MEDIA_LOADING_THREAD_COUNT: int = 8
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
+    VLLM_IMAGE_LOADER_BACKEND: str = "pil"
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
     VLLM_MM_HASHER_ALGORITHM: str = "blake3"
@@ -850,6 +851,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default is 25 MB
     "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": lambda: int(
         os.getenv("VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", "25")
+    ),
+    # Backend for Image IO
+    # - "pil": Default backend that uses Pillow.
+    # - "nvimagecodec": Optional backend that uses NVIDIA nvImageCodec.
+    # - "nvimagecodec_gpu_resident": GPU-resident nvImageCodec backend.
+    #
+    # Custom backend implementations can be registered
+    # via `@IMAGE_LOADER_REGISTRY.register("my_custom_image_loader")` and
+    # imported at runtime.
+    # If a non-existing backend is used, an AssertionError will be thrown.
+    "VLLM_IMAGE_LOADER_BACKEND": lambda: os.getenv(
+        "VLLM_IMAGE_LOADER_BACKEND", "pil"
     ),
     # Backend for Video IO — selects the frame-sampling algorithm.
     # - "opencv": uniform sampling.
@@ -1917,6 +1930,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MEDIA_URL_ALLOW_REDIRECTS",
         "VLLM_MEDIA_LOADING_THREAD_COUNT",
         "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB",
+        "VLLM_IMAGE_LOADER_BACKEND",
         "VLLM_VIDEO_LOADER_BACKEND",
         "VLLM_MEDIA_CONNECTOR",
         "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
