@@ -86,6 +86,20 @@ from vllm.multimodal.inputs import (
     VideoItem,
 )
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
+from vllm.multimodal.weighted_admission import (
+    describe_tensor,
+    estimate_image_reservation_bytes,
+    mem_trace,
+    pop_decode_reservation_for_tensor,
+    prepare_hf_inputs_for_transport,
+    register_unattached_reservation,
+    release_reservations,
+    reserve_many,
+    reserve_bytes,
+    resize_reservation,
+    resize_reservations,
+)
+# GPURES_WEIGHTED_ADMISSION_QWEN_IMPORT
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -1269,25 +1283,222 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             dict(**mm_kwargs, **tok_kwargs),
         )
 
+        # GPURES_WEIGHTED_ADMISSION_QWEN_LOOP -- acquire an explicit byte reservation
+        # before each GPU preprocess call. Tokens are transferred through
+        # the BatchFeature/pixel_values storage side table. direct_rpc
+        # spills pixel_values back to CPU and releases immediately;
+        # torch_shm keeps CUDA pixel_values and releases at output finish.
         all_patches = []
         all_grid_thw = []
-        for gpu_img in gpu_images:
-            patches, grid_thw = gpu_proc.preprocess_single(gpu_img)
-            all_patches.append(patches)
-            all_grid_thw.append(grid_thw)
+        _gpures_reservations = []
+        _gpures_all_tokens = []
+        _gpures_token = None
+        _gpures_transferred = False
+        mem_trace(
+            "qwen-preprocess-call-start",
+            gpu_images_len=len(gpu_images),
+            force=True,
+        )
+        try:
+            _gpures_plans = []
+            _gpures_missing_plan_indexes = []
+            _gpures_missing_bytes = []
+            _gpures_missing_labels = []
+            _gpures_existing_tokens = []
+            _gpures_existing_bytes = []
+            _gpures_existing_labels = []
+            for _gpures_idx, gpu_img in enumerate(gpu_images):
+                _gpures_token = None
+                mem_trace(
+                    "qwen-image-before-estimate",
+                    index=_gpures_idx,
+                    image=describe_tensor(gpu_img),
+                    force=False,
+                )
+                _gpures_token = pop_decode_reservation_for_tensor(
+                    gpu_img
+                )
+                _gpures_bytes = estimate_image_reservation_bytes(
+                    gpu_img, gpu_proc
+                )
+                mem_trace(
+                    "qwen-image-before-acquire",
+                    index=_gpures_idx,
+                    estimated_bytes=_gpures_bytes,
+                    has_decode_token=_gpures_token is not None,
+                    force=False,
+                )
+                _gpures_label = f"qwen3_vl.image.{_gpures_idx}"
+                _gpures_plan_index = len(_gpures_plans)
+                _gpures_plans.append([
+                    _gpures_idx,
+                    gpu_img,
+                    _gpures_token,
+                    _gpures_bytes,
+                    _gpures_label,
+                ])
+                if _gpures_token is None:
+                    _gpures_missing_plan_indexes.append(
+                        _gpures_plan_index
+                    )
+                    _gpures_missing_bytes.append(_gpures_bytes)
+                    _gpures_missing_labels.append(_gpures_label)
+                else:
+                    _gpures_existing_tokens.append(_gpures_token)
+                    _gpures_existing_bytes.append(_gpures_bytes)
+                    _gpures_existing_labels.append(_gpures_label)
 
-        if all_patches:
-            hf_output["pixel_values"] = torch.cat(all_patches, dim=0)
-            # Free individual patch tensors after concatenation
-            del all_patches
-            hf_output["image_grid_thw"] = torch.tensor(
-                all_grid_thw, dtype=torch.int64
+            if _gpures_missing_bytes:
+                mem_trace(
+                    "qwen-before-acquire-many",
+                    images=len(gpu_images),
+                    missing_tokens=len(_gpures_missing_bytes),
+                    requested_bytes=sum(_gpures_missing_bytes),
+                    force=True,
+                )
+                _gpures_new_tokens = reserve_many(
+                    _gpures_missing_bytes,
+                    _gpures_missing_labels,
+                )
+                for _gpures_plan_index, _gpures_token in zip(
+                    _gpures_missing_plan_indexes,
+                    _gpures_new_tokens,
+                ):
+                    _gpures_plans[_gpures_plan_index][2] = _gpures_token
+
+            if _gpures_existing_tokens:
+                _gpures_resized_tokens = resize_reservations(
+                    _gpures_existing_tokens,
+                    _gpures_existing_bytes,
+                    _gpures_existing_labels,
+                )
+                _gpures_resized_iter = iter(_gpures_resized_tokens)
+                for _gpures_plan in _gpures_plans:
+                    if _gpures_plan[2] in _gpures_existing_tokens:
+                        _gpures_plan[2] = next(_gpures_resized_iter)
+
+            _gpures_all_tokens = [
+                _gpures_plan[2] for _gpures_plan in _gpures_plans
+                if _gpures_plan[2] is not None
+            ]
+            mem_trace(
+                "qwen-after-acquire-many",
+                images=len(gpu_images),
+                tokens=len(_gpures_all_tokens),
+                token_bytes=sum(
+                    token.nbytes for token in _gpures_all_tokens
+                ),
+                force=True,
             )
 
+            for _gpures_plan in _gpures_plans:
+                (
+                    _gpures_idx,
+                    gpu_img,
+                    _gpures_token,
+                    _gpures_bytes,
+                    _gpures_label,
+                ) = _gpures_plan
+                mem_trace(
+                    "qwen-image-after-acquire",
+                    index=_gpures_idx,
+                    token_nbytes=_gpures_token.nbytes,
+                    force=False,
+                )
+                register_unattached_reservation(_gpures_token)
+                try:
+                    mem_trace(
+                        "qwen-image-before-preprocess",
+                        index=_gpures_idx,
+                        force=False,
+                    )
+                    patches, grid_thw = gpu_proc.preprocess_single(gpu_img)
+                    mem_trace(
+                        "qwen-image-after-preprocess",
+                        index=_gpures_idx,
+                        patches=describe_tensor(patches),
+                        grid_thw=grid_thw,
+                        force=False,
+                    )
+                except BaseException:
+                    mem_trace(
+                        "qwen-image-preprocess-exception",
+                        index=_gpures_idx,
+                        force=True,
+                    )
+                    release_reservations([_gpures_token])
+                    raise
+                _gpures_reservations.append(_gpures_token)
+                all_patches.append(patches)
+                all_grid_thw.append(grid_thw)
+
+            if all_patches:
+                hf_output["pixel_values"] = torch.cat(all_patches, dim=0)
+                mem_trace(
+                    "qwen-after-cat",
+                    pixel_values=describe_tensor(hf_output["pixel_values"]),
+                    patches_len=len(all_patches),
+                    force=False,
+                )
+                # Free individual patch tensors after concatenation
+                del all_patches
+                hf_output["image_grid_thw"] = torch.tensor(
+                    all_grid_thw, dtype=torch.int64
+                )
+                _gpures_transport_mode = prepare_hf_inputs_for_transport(
+                    hf_output,
+                    self.info.ctx.get_mm_config(),
+                    _gpures_reservations,
+                )
+                mem_trace(
+                    "qwen-after-transport",
+                    mode=_gpures_transport_mode,
+                    pixel_values=describe_tensor(hf_output["pixel_values"]),
+                    reservations=len(_gpures_reservations),
+                    force=False,
+                )
+                _gpures_transferred = True
+            else:
+                mem_trace("qwen-no-patches-release", force=True)
+                release_reservations(_gpures_all_tokens)
+                _gpures_transferred = True
+        except BaseException:
+            if not _gpures_transferred:
+                mem_trace("qwen-exception-release", force=True)
+                try:
+                    if (
+                        _gpures_token is not None
+                        and _gpures_token not in _gpures_all_tokens
+                    ):
+                        release_reservations([_gpures_token])
+                except Exception:
+                    pass
+                release_reservations(_gpures_all_tokens)
+            raise
+
+        # REFLEAK_FIX_GPU_PREPROCESS_CALL — also clear the caller's
+        # mm_data["images"] list. ``gpu_images`` is a local list of
+        # refs; the original mm_data["images"] is the upstream-owned
+        # list that *also* holds the same refs. Nulling the local
+        # alone leaves the originals pinned until mm_data drops.
+        try:
+            images_list = mm_data.get("images")
+            if isinstance(images_list, list):
+                for j in range(len(images_list)):
+                    images_list[j] = None
+        except Exception:
+            # Non-list (tuple, generator); best-effort only.
+            pass
         # Explicitly free decoded GPU image tensors (t465: prevent
         # input tensors from lingering when caller holds the list)
         for i in range(len(gpu_images)):
             gpu_images[i] = None
+
+        # Synchronize so any async kernel queued against an
+        # intermediate finishes before we return. Without this, the
+        # intermediate would be retained until the kernel completes
+        # later, fragmenting the caching allocator.
+        torch.cuda.synchronize()
 
         return hf_output
 

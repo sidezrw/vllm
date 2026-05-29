@@ -456,6 +456,26 @@ class BaseMultiModalField(ABC):
             pin_memory = False
 
         batch = [elem.data for elem in elems]
+        # GPURES_WEIGHTED_ADMISSION_CUDA_PIN_MEMORY -- torch_shm may pass CUDA tensors here;
+        # pin_memory=True is valid only for dense CPU tensors.
+        if pin_memory:
+            def _gpures_has_non_cpu_tensor(data):
+                if isinstance(data, torch.Tensor):
+                    return data.device.type != "cpu"
+                if isinstance(data, (list, tuple)):
+                    return any(
+                        _gpures_has_non_cpu_tensor(item)
+                        for item in data
+                    )
+                if isinstance(data, dict):
+                    return any(
+                        _gpures_has_non_cpu_tensor(item)
+                        for item in data.values()
+                    )
+                return False
+
+            if any(_gpures_has_non_cpu_tensor(item) for item in batch):
+                pin_memory = False
         out = self._reduce_data(batch, pin_memory=pin_memory)
         return _nested_tensors_h2d(out, device=device)
 

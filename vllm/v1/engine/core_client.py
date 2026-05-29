@@ -630,9 +630,27 @@ class MPClient(EngineCoreClient):
     def add_pending_message(self, tracker: zmq.MessageTracker, msg: Any):
         if not tracker.done:
             self.pending_messages.appendleft((tracker, msg))
+            from vllm.multimodal.weighted_admission import (
+                release_request_when_tracker_done,
+            )
+            release_request_when_tracker_done(
+                tracker, msg, clear_data=True
+            )
+            return
+        from vllm.multimodal.weighted_admission import (
+            release_request_after_send,
+        )
+        release_request_after_send(msg, clear_data=True)
 
     def free_pending_messages(self):
+        # GPURES_WEIGHTED_ADMISSION_FREE_PENDING -- release explicit GPU preprocess
+        # reservations only after ZMQ reports MessageTracker.done.
+        from vllm.multimodal.weighted_admission import (
+            release_request_after_send,
+        )
         while self.pending_messages and self.pending_messages[-1][0].done:
+            _, _completed_request = self.pending_messages[-1]
+            release_request_after_send(_completed_request, clear_data=True)
             self.pending_messages.pop()
 
     def dp_engines_running(self) -> bool:
@@ -761,6 +779,15 @@ class SyncMPClient(MPClient):
                     frames = out_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    # GPURES_WEIGHTED_ADMISSION_OUTPUT_RELEASE -- tracker.done can lag
+                    # indefinitely for the final ZMQ batch; an engine
+                    # finished output proves the request was consumed.
+                    from vllm.multimodal.weighted_admission import (
+                        release_finished_request_reservations,
+                    )
+                    release_finished_request_reservations(
+                        outputs, clear_data=True
+                    )
                     if outputs.utility_output:
                         _process_utility_output(outputs.utility_output, utility_results)
                     else:
@@ -802,8 +829,16 @@ class SyncMPClient(MPClient):
         msg = (self.core_engine, request_type.value, *self.encoder.encode(request))
 
         if len(msg) <= 3:
-            # No auxiliary buffers => no tensor backing buffers in request.
-            self.input_socket.send_multipart(msg, copy=False)
+            # No auxiliary buffers => no tracked ZMQ completion; release
+            # any explicit GPU preprocess reservation immediately after
+            # send_multipart returns.
+            try:
+                self.input_socket.send_multipart(msg, copy=False)
+            finally:
+                from vllm.multimodal.weighted_admission import (
+                    release_request_after_send,
+                )
+                release_request_after_send(request, clear_data=True)
             return
 
         tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
@@ -945,6 +980,15 @@ class AsyncMPClient(MPClient):
                     frames = await output_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    # GPURES_WEIGHTED_ADMISSION_OUTPUT_RELEASE -- tracker.done can lag
+                    # indefinitely for the final ZMQ batch; an engine
+                    # finished output proves the request was consumed.
+                    from vllm.multimodal.weighted_admission import (
+                        release_finished_request_reservations,
+                    )
+                    release_finished_request_reservations(
+                        outputs, clear_data=True
+                    )
                     if outputs.utility_output:
                         if (
                             outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID
@@ -1022,15 +1066,30 @@ class AsyncMPClient(MPClient):
 
         msg = (engine,) + message
         if not objects or len(msg) <= 3:
-            # No auxiliary buffers => no tensor backing buffers in request.
-            return self.input_socket.send_multipart(msg, copy=False)
+            # No auxiliary buffers => no tracked ZMQ completion; release
+            # any explicit GPU preprocess reservation immediately after
+            # send_multipart returns.
+            try:
+                return self.input_socket.send_multipart(msg, copy=False)
+            finally:
+                from vllm.multimodal.weighted_admission import (
+                    release_request_after_send,
+                )
+                release_request_after_send(objects, clear_data=True)
 
         future: asyncio.Future[zmq.MessageTracker]
         future = self.input_socket.send_multipart(msg, copy=False, track=True)
 
         def add_pending(f: asyncio.Future[zmq.MessageTracker]):
-            with contextlib.suppress(BaseException):
-                self.add_pending_message(f.result(), objects)
+            try:
+                tracker = f.result()
+            except BaseException:
+                from vllm.multimodal.weighted_admission import (
+                    release_request_reservations,
+                )
+                release_request_reservations(objects, clear_data=True)
+                return
+            self.add_pending_message(tracker, objects)
 
         future.add_done_callback(add_pending)
         return future
