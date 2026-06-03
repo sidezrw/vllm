@@ -174,8 +174,9 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
         # post-clone synchronize so nvimgcodec pool slots release
         # before this function returns. See patches/refleak-fix/
         # apply_patch.py docstring for the full rationale.
-        # GPURES_MINIMAL_DECODE_GATE
-        from vllm.multimodal.gpures_minimal import reserve_decode_batch
+        from vllm.multimodal.weighted_admission_semaphore import (
+            reserve_decode_batch,
+        )
         _gpures_decode_token = reserve_decode_batch(
             len(code_streams), "nvimagecodec.decode"
         )
@@ -207,8 +208,9 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
                 view = torch.from_dlpack(decoded)
                 gpu_tensor = view.clone()
                 del view
-                # GPURES_MINIMAL_DECODE_RESIDENCY
-                from vllm.multimodal.gpures_minimal import attach_decode_residency
+                from vllm.multimodal.weighted_admission_semaphore import (
+                    attach_decode_residency,
+                )
                 attach_decode_residency(gpu_tensor, f"nvimagecodec.decoded.{i}")
                 results.append(gpu_tensor)
                 # Free nvimgcodec buffer reference (t465: prevent decoder
@@ -258,7 +260,6 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
                     timeout=cls._batch_timeout_s + 0.01
                 ):
                     cls._flush_batch()
-                    # GPURES_MINIMAL_DECODE_WAIT
                     _gpures_wait_s = float(os.environ.get(
                         "VLLM_GPU_DECODE_RESULT_WAIT_TIMEOUT_S", "0"
                     ) or "0")
@@ -286,8 +287,9 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
             items = list(cls._pending_items)
             cls._pending_items.clear()
 
-        # GPURES_MINIMAL_FLUSH_CHUNKS
-        from vllm.multimodal.gpures_minimal import decode_batch_limit
+        from vllm.multimodal.weighted_admission_semaphore import (
+            decode_batch_limit,
+        )
         limit = decode_batch_limit(cls._batch_size)
         try:
             for start in range(0, len(items), limit):

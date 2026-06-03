@@ -1,4 +1,4 @@
-"""Bounded GPU decode/preprocess residency for issue 255."""
+"""Weighted semaphores for bounded GPU decode/preprocess residency."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ import time
 import weakref
 from typing import Any, Iterable
 
-TOKEN_ATTR = "_vllm_gpures_token"
-TOKENS_ATTR = "_vllm_gpures_tokens"
-DECODE_TOKEN_ATTR = "_vllm_gpures_decode_token"
+TOKEN_ATTR = "_vllm_weighted_admission_token"
+TOKENS_ATTR = "_vllm_weighted_admission_tokens"
+DECODE_TOKEN_ATTR = "_vllm_weighted_decode_token"
 _MB = 1024 * 1024
 
 
@@ -36,10 +36,10 @@ def _nbytes(obj: Any) -> int:
         return 0
 
 
-class _Token:
-    def __init__(self, gate: "_Gate", nbytes: int) -> None:
-        self._gate = gate
-        self.nbytes = nbytes
+class _Reservation:
+    def __init__(self, semaphore: "_WeightedSemaphore", weight_bytes: int) -> None:
+        self._semaphore = semaphore
+        self.weight_bytes = weight_bytes
         self._released = False
         self._lock = threading.Lock()
 
@@ -48,7 +48,7 @@ class _Token:
             if self._released:
                 return False
             self._released = True
-        self._gate.release(self)
+        self._semaphore.release(self)
         return True
 
     def __del__(self) -> None:
@@ -56,7 +56,7 @@ class _Token:
             self.release()
 
 
-class _Gate:
+class _WeightedSemaphore:
     def __init__(self, env: str, default_mb: int) -> None:
         self._cv = threading.Condition()
         self._name = env
@@ -64,31 +64,32 @@ class _Gate:
         self._reserved = self._peak = self._acquires = self._releases = 0
         self._inflight = 0
 
-    def acquire(self, nbytes: int, label: str) -> _Token:
-        nbytes = max(1, min(int(nbytes), self._budget))
+    def acquire(self, weight_bytes: int, label: str) -> _Reservation:
+        weight_bytes = max(1, min(int(weight_bytes), self._budget))
         next_log = 0.0
         with self._cv:
-            while self._reserved + nbytes > self._budget:
+            while self._reserved + weight_bytes > self._budget:
                 if _env_int("VLLM_GPU_PREPROCESS_TRACE", 0):
                     now = time.monotonic()
                     if now >= next_log:
                         print(
-                            f"[gpures_minimal] gate_wait name={self._name} "
-                            f"label={label} needed={nbytes} "
+                            "[weighted_admission_semaphore] wait "
+                            f"name={self._name} label={label} "
+                            f"needed={weight_bytes} "
                             f"reserved={self._reserved} budget={self._budget}",
                             flush=True,
                         )
                         next_log = now + 5.0
                 self._cv.wait(0.05)
-            self._reserved += nbytes
+            self._reserved += weight_bytes
             self._peak = max(self._peak, self._reserved)
             self._acquires += 1
             self._inflight += 1
-        return _Token(self, nbytes)
+        return _Reservation(self, weight_bytes)
 
-    def release(self, token: _Token) -> None:
+    def release(self, reservation: _Reservation) -> None:
         with self._cv:
-            self._reserved = max(0, self._reserved - token.nbytes)
+            self._reserved = max(0, self._reserved - reservation.weight_bytes)
             self._releases += 1
             self._inflight = max(0, self._inflight - 1)
             self._cv.notify_all()
@@ -105,15 +106,15 @@ class _Gate:
             }
 
 
-_PREPROCESS_GATE = _Gate("VLLM_GPU_PREPROCESS_BUDGET_MB", 8192)
-_RESIDENT_GATE = _Gate(
+_PREPROCESS_SEMAPHORE = _WeightedSemaphore("VLLM_GPU_PREPROCESS_BUDGET_MB", 8192)
+_RESIDENT_SEMAPHORE = _WeightedSemaphore(
     "VLLM_GPU_PREPROCESS_RESIDENT_BUDGET_MB",
     _env_int("VLLM_GPU_PREPROCESS_BUDGET_MB", 8192),
 )
-_DECODE_GATE = _Gate("VLLM_GPU_DECODE_BUDGET_MB", 1536)
-_DECODE_RESIDENCY_GATE = _Gate("VLLM_GPU_DECODE_RESIDENCY_BUDGET_MB", 512)
+_DECODE_SEMAPHORE = _WeightedSemaphore("VLLM_GPU_DECODE_BUDGET_MB", 1536)
+_DECODE_RESIDENCY_SEMAPHORE = _WeightedSemaphore("VLLM_GPU_DECODE_RESIDENCY_BUDGET_MB", 512)
 _REQUEST_LOCK = threading.Lock()
-_REQUEST_TOKENS: dict[str, list[_Token]] = {}
+_REQUEST_TOKENS: dict[str, list[_Reservation]] = {}
 _FINISHED_EARLY: dict[str, None] = {}
 
 
@@ -138,20 +139,20 @@ def release_tokens(tokens: Iterable[Any]) -> int:
     )
 
 
-def reserve_preprocess(image: Any, label: str) -> _Token:
-    token = _PREPROCESS_GATE.acquire(max(_preprocess_floor(), _nbytes(image) * 4),
+def reserve_preprocess(image: Any, label: str) -> _Reservation:
+    token = _PREPROCESS_SEMAPHORE.acquire(max(_preprocess_floor(), _nbytes(image) * 4),
                                      label)
     release_decode_residency(image)
     return token
 
 
-def reserve_resident(pixel_values: Any, label: str) -> _Token:
-    return _RESIDENT_GATE.acquire(max(_resident_floor(), _nbytes(pixel_values)),
+def reserve_resident(pixel_values: Any, label: str) -> _Reservation:
+    return _RESIDENT_SEMAPHORE.acquire(max(_resident_floor(), _nbytes(pixel_values)),
                                   label)
 
 
-def reserve_decode_batch(count: int, label: str) -> _Token:
-    return _DECODE_GATE.acquire(
+def reserve_decode_batch(count: int, label: str) -> _Reservation:
+    return _DECODE_SEMAPHORE.acquire(
         max(1, count) * _mb_env("VLLM_GPU_DECODE_RESERVATION_MB", 128),
         label,
     )
@@ -163,7 +164,7 @@ def decode_batch_limit(configured: int | None = None) -> int:
 
 
 def attach_decode_residency(tensor: Any, label: str) -> bool:
-    token = _DECODE_RESIDENCY_GATE.acquire(
+    token = _DECODE_RESIDENCY_SEMAPHORE.acquire(
         max(_mb_env("VLLM_GPU_DECODE_RESIDENCY_MB", 1), _nbytes(tensor)),
         label,
     )
@@ -204,7 +205,7 @@ def _set(obj: Any, key: str, value: Any) -> bool:
     return False
 
 
-def _attach(obj: Any, tokens: list[_Token]) -> bool:
+def _attach(obj: Any, tokens: list[_Reservation]) -> bool:
     try:
         setattr(obj, TOKENS_ATTR, tokens)
         return True
@@ -222,11 +223,11 @@ def _keep_gpu(mm_config: Any) -> bool:
 
 
 def finalize_hf_inputs(hf_inputs: Any, mm_config: Any,
-                       tokens: Iterable[_Token]) -> str:
+                       tokens: Iterable[_Reservation]) -> str:
     scratch = list(tokens)
     pixel_values = _get(hf_inputs, "pixel_values")
     if _keep_gpu(mm_config):
-        resident: list[_Token] = []
+        resident: list[_Reservation] = []
         try:
             if pixel_values is not None:
                 resident.append(reserve_resident(pixel_values,
@@ -263,20 +264,20 @@ def attach_tokens_to_items(hf_inputs: Any, items: Iterable[Any]) -> int:
     return attached
 
 
-def _pull_tokens(obj: Any, seen: set[int] | None = None) -> list[_Token]:
+def _pull_tokens(obj: Any, seen: set[int] | None = None) -> list[_Reservation]:
     if obj is None:
         return []
-    if isinstance(obj, _Token):
+    if isinstance(obj, _Reservation):
         return [obj]
     seen = set() if seen is None else seen
     if id(obj) in seen:
         return []
     seen.add(id(obj))
-    found: dict[int, _Token] = {}
+    found: dict[int, _Reservation] = {}
 
     def add(values: Iterable[Any]) -> None:
         for value in values:
-            if isinstance(value, _Token):
+            if isinstance(value, _Reservation):
                 found[id(value)] = value
 
     for attr in (TOKEN_ATTR, TOKENS_ATTR):
@@ -340,7 +341,7 @@ def finish_outputs(outputs: Any) -> int:
         rid = getattr(output, "request_id", None)
         if getattr(output, "finished", False) and isinstance(rid, str) and rid:
             finished.add(rid)
-    released: list[_Token] = []
+    released: list[_Reservation] = []
     with _REQUEST_LOCK:
         for request_id in finished:
             tokens = _REQUEST_TOKENS.pop(request_id, None)
@@ -354,9 +355,9 @@ def finish_outputs(outputs: Any) -> int:
 
 
 def summary() -> dict[str, Any]:
-    out = _PREPROCESS_GATE.stats()
-    for prefix, gate in (("resident", _RESIDENT_GATE), ("decode", _DECODE_GATE),
-                         ("decode_residency", _DECODE_RESIDENCY_GATE)):
+    out = _PREPROCESS_SEMAPHORE.stats()
+    for prefix, gate in (("resident", _RESIDENT_SEMAPHORE), ("decode", _DECODE_SEMAPHORE),
+                         ("decode_residency", _DECODE_RESIDENCY_SEMAPHORE)):
         out.update({f"{prefix}_{key}": value for key, value in gate.stats().items()})
     with _REQUEST_LOCK:
         out["active_requests"] = len(_REQUEST_TOKENS)
@@ -366,14 +367,14 @@ def summary() -> dict[str, Any]:
 
 def _write_summary() -> None:
     path = os.environ.get("VLLM_GPU_PREPROCESS_SUMMARY_PATH",
-                          "/workspace/results/gpures_minimal_summary.json")
+                          "/workspace/results/weighted_admission_summary.json")
     try:
         if os.path.dirname(path) and not os.path.isdir(os.path.dirname(path)):
             return
         with open(path, "w", encoding="utf-8") as f:
             json.dump(summary(), f, indent=2, sort_keys=True)
     except Exception:
-        print("[gpures_minimal] failed to write summary", flush=True)
+        print("[weighted_admission_semaphore] failed to write summary", flush=True)
 
 
 atexit.register(_write_summary)

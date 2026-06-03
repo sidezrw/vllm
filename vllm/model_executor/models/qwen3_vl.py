@@ -86,12 +86,11 @@ from vllm.multimodal.inputs import (
     VideoItem,
 )
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
-from vllm.multimodal.gpures_minimal import (
+from vllm.multimodal.weighted_admission_semaphore import (
     finalize_hf_inputs,
     release_tokens,
     reserve_preprocess,
 )
-# GPURES_MINIMAL_QWEN_IMPORT
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -1275,7 +1274,6 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             dict(**mm_kwargs, **tok_kwargs),
         )
 
-        # GPURES_MINIMAL_QWEN_LOOP -- one bounded token per image.
         all_patches = []
         all_grid_thw = []
         _gpures_tokens = []
