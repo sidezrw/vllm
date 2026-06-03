@@ -456,6 +456,18 @@ class BaseMultiModalField(ABC):
             pin_memory = False
 
         batch = [elem.data for elem in elems]
+        # GPURES_MINIMAL_PIN_MEMORY -- CUDA tensors cannot be pinned as CPU memory.
+        if pin_memory:
+            def _has_cuda(data):
+                if isinstance(data, torch.Tensor):
+                    return data.device.type != "cpu"
+                if isinstance(data, (list, tuple)):
+                    return any(_has_cuda(item) for item in data)
+                if isinstance(data, dict):
+                    return any(_has_cuda(item) for item in data.values())
+                return False
+            if any(_has_cuda(item) for item in batch):
+                pin_memory = False
         out = self._reduce_data(batch, pin_memory=pin_memory)
         return _nested_tensors_h2d(out, device=device)
 
@@ -948,6 +960,9 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
                 MultiModalKwargsItem({k: v[i] for k, v in elems_in_modality.items()})
                 for i in range(batch_size)
             ]
+            # # GPURES_MINIMAL_ATTACH_ITEMS
+            from vllm.multimodal.gpures_minimal import attach_tokens_to_items
+            attach_tokens_to_items(hf_inputs, items_by_modality[modality])
 
         return MultiModalKwargsItems(items_by_modality)
 

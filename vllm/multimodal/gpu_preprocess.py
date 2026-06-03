@@ -264,58 +264,71 @@ class Qwen2VLGPUPreprocessor:
         Returns:
             (flatten_patches, grid_thw) matching CPU preprocessor output format.
         """
-        # Ensure GPU
-        if image.device != self.device:
-            image = image.to(self.device, non_blocking=True)
+        # REFLEAK_FIX_PREPROCESS_SINGLE — actually acquire the
+        # _GPU_PREPROCESS_SEMAPHORE (declared at module level but
+        # never used in the upstream fork). Without this, rnw
+        # workers race unbounded on F.interpolate's bicubic
+        # antialias workspace; PyTorch's caching allocator pins
+        # the peak high-water-mark forever.
+        with _GPU_PREPROCESS_SEMAPHORE:
+            # Ensure GPU
+            if image.device != self.device:
+                image = image.to(self.device, non_blocking=True)
 
-        # Handle HWC -> CHW
-        if image.ndim == 3 and image.shape[2] in (1, 3, 4):
-            # Heuristic: if last dim is small channel count, it's HWC
-            if image.shape[0] not in (1, 3, 4) or image.shape[2] <= 4:
-                image = image.permute(2, 0, 1).contiguous()
+            # Handle HWC -> CHW
+            if image.ndim == 3 and image.shape[2] in (1, 3, 4):
+                # Heuristic: if last dim is small channel count, it's HWC
+                if image.shape[0] not in (1, 3, 4) or image.shape[2] <= 4:
+                    image = image.permute(2, 0, 1).contiguous()
 
-        # Convert to float32 if needed
-        if image.dtype != torch.float32:
-            float_image = image.float()
+            # Convert to float32 if needed
+            if image.dtype != torch.float32:
+                float_image = image.float()
+                del image
+                image = float_image
+
+            C, H, W = image.shape
+            assert C in (1, 3), f"Expected 1 or 3 channels, got {C}"
+
+            # Convert grayscale to RGB
+            if C == 1:
+                image = image.expand(3, -1, -1).contiguous()
+
+            resized_height, resized_width = H, W
+
+            if do_resize:
+                resized_height, resized_width = smart_resize(
+                    H, W,
+                    factor=self.factor,
+                    min_pixels=self.min_pixels,
+                    max_pixels=self.max_pixels,
+                )
+                if resized_height != H or resized_width != W:
+                    pre_resize = image
+                    image = self._resize_gpu(image, resized_height, resized_width)
+                    del pre_resize
+
+            if do_rescale and do_normalize:
+                # Fused in-place rescale + normalize
+                image = self._normalize_gpu(image)
+            elif do_rescale:
+                image.mul_(self.rescale_factor)
+            elif do_normalize:
+                # Assume already in [0, 1] range
+                image.sub_(self._mean)
+                image.div_(self._std)
+
+            # Add temporal dimension: (C, H, W) -> (1, C, H, W)
+            patches = image.unsqueeze(0)
             del image
-            image = float_image
 
-        C, H, W = image.shape
-        assert C in (1, 3), f"Expected 1 or 3 channels, got {C}"
-
-        # Convert grayscale to RGB
-        if C == 1:
-            image = image.expand(3, -1, -1).contiguous()
-
-        resized_height, resized_width = H, W
-
-        if do_resize:
-            resized_height, resized_width = smart_resize(
-                H, W,
-                factor=self.factor,
-                min_pixels=self.min_pixels,
-                max_pixels=self.max_pixels,
-            )
-            if resized_height != H or resized_width != W:
-                pre_resize = image
-                image = self._resize_gpu(image, resized_height, resized_width)
-                del pre_resize
-
-        if do_rescale and do_normalize:
-            # Fused in-place rescale + normalize
-            image = self._normalize_gpu(image)
-        elif do_rescale:
-            image.mul_(self.rescale_factor)
-        elif do_normalize:
-            # Assume already in [0, 1] range
-            image.sub_(self._mean)
-            image.div_(self._std)
-
-        # Add temporal dimension: (C, H, W) -> (1, C, H, W)
-        patches = image.unsqueeze(0)
-        del image
-
-        return self._reshape_to_patches(patches, resized_height, resized_width)
+            # Synchronize once at function exit so the async
+            # preprocess kernels finish; any kernel still queued
+            # against an intermediate would otherwise keep the
+            # tensor alive past the Python ``del`` and defeat the
+            # leak fix in the caller (_gpu_preprocess_call).
+            torch.cuda.synchronize()
+            return self._reshape_to_patches(patches, resized_height, resized_width)
 
     @torch.no_grad()
     def preprocess_batch(

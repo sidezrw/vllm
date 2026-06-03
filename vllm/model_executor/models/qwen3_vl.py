@@ -86,6 +86,12 @@ from vllm.multimodal.inputs import (
     VideoItem,
 )
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
+from vllm.multimodal.gpures_minimal import (
+    finalize_hf_inputs,
+    release_tokens,
+    reserve_preprocess,
+)
+# GPURES_MINIMAL_QWEN_IMPORT
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -1269,25 +1275,66 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             dict(**mm_kwargs, **tok_kwargs),
         )
 
+        # GPURES_MINIMAL_QWEN_LOOP -- one bounded token per image.
         all_patches = []
         all_grid_thw = []
-        for gpu_img in gpu_images:
-            patches, grid_thw = gpu_proc.preprocess_single(gpu_img)
-            all_patches.append(patches)
-            all_grid_thw.append(grid_thw)
+        _gpures_tokens = []
+        try:
+            for _gpures_idx, gpu_img in enumerate(gpu_images):
+                _gpures_token = reserve_preprocess(
+                    gpu_img, f"qwen3_vl.image.{_gpures_idx}"
+                )
+                try:
+                    patches, grid_thw = gpu_proc.preprocess_single(gpu_img)
+                except BaseException:
+                    _gpures_token.release()
+                    raise
+                _gpures_tokens.append(_gpures_token)
+                all_patches.append(patches)
+                all_grid_thw.append(grid_thw)
 
-        if all_patches:
-            hf_output["pixel_values"] = torch.cat(all_patches, dim=0)
-            # Free individual patch tensors after concatenation
-            del all_patches
-            hf_output["image_grid_thw"] = torch.tensor(
-                all_grid_thw, dtype=torch.int64
-            )
+            if all_patches:
+                hf_output["pixel_values"] = torch.cat(all_patches, dim=0)
+                del all_patches
+                hf_output["image_grid_thw"] = torch.tensor(
+                    all_grid_thw, dtype=torch.int64
+                )
+                finalize_hf_inputs(
+                    hf_output,
+                    self.info.ctx.get_mm_config(),
+                    _gpures_tokens,
+                )
+                _gpures_tokens = []
+            else:
+                release_tokens(_gpures_tokens)
+                _gpures_tokens = []
+        except BaseException:
+            release_tokens(_gpures_tokens)
+            raise
 
+        # REFLEAK_FIX_GPU_PREPROCESS_CALL — also clear the caller's
+        # mm_data["images"] list. ``gpu_images`` is a local list of
+        # refs; the original mm_data["images"] is the upstream-owned
+        # list that *also* holds the same refs. Nulling the local
+        # alone leaves the originals pinned until mm_data drops.
+        try:
+            images_list = mm_data.get("images")
+            if isinstance(images_list, list):
+                for j in range(len(images_list)):
+                    images_list[j] = None
+        except Exception:
+            # Non-list (tuple, generator); best-effort only.
+            pass
         # Explicitly free decoded GPU image tensors (t465: prevent
         # input tensors from lingering when caller holds the list)
         for i in range(len(gpu_images)):
             gpu_images[i] = None
+
+        # Synchronize so any async kernel queued against an
+        # intermediate finishes before we return. Without this, the
+        # intermediate would be retained until the kernel completes
+        # later, fragmenting the caching allocator.
+        torch.cuda.synchronize()
 
         return hf_output
 

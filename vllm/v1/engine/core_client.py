@@ -628,6 +628,9 @@ class MPClient(EngineCoreClient):
             raise EngineDeadError()
 
     def add_pending_message(self, tracker: zmq.MessageTracker, msg: Any):
+        # GPURES_MINIMAL_TRACK_PENDING
+        from vllm.multimodal.gpures_minimal import track_requests
+        track_requests(msg)
         if not tracker.done:
             self.pending_messages.appendleft((tracker, msg))
 
@@ -761,6 +764,9 @@ class SyncMPClient(MPClient):
                     frames = out_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    # GPURES_MINIMAL_FINISH_OUTPUTS
+                    from vllm.multimodal.gpures_minimal import finish_outputs
+                    finish_outputs(outputs)
                     if outputs.utility_output:
                         _process_utility_output(outputs.utility_output, utility_results)
                     else:
@@ -804,6 +810,9 @@ class SyncMPClient(MPClient):
         if len(msg) <= 3:
             # No auxiliary buffers => no tensor backing buffers in request.
             self.input_socket.send_multipart(msg, copy=False)
+            # GPURES_MINIMAL_SYNC_NO_AUX
+            from vllm.multimodal.gpures_minimal import track_requests
+            track_requests(request)
             return
 
         tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
@@ -945,6 +954,9 @@ class AsyncMPClient(MPClient):
                     frames = await output_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    # GPURES_MINIMAL_FINISH_OUTPUTS
+                    from vllm.multimodal.gpures_minimal import finish_outputs
+                    finish_outputs(outputs)
                     if outputs.utility_output:
                         if (
                             outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID
@@ -1023,14 +1035,22 @@ class AsyncMPClient(MPClient):
         msg = (engine,) + message
         if not objects or len(msg) <= 3:
             # No auxiliary buffers => no tensor backing buffers in request.
-            return self.input_socket.send_multipart(msg, copy=False)
+            ret = self.input_socket.send_multipart(msg, copy=False)
+            # GPURES_MINIMAL_ASYNC_NO_AUX
+            from vllm.multimodal.gpures_minimal import track_requests
+            track_requests(objects)
+            return ret
 
         future: asyncio.Future[zmq.MessageTracker]
         future = self.input_socket.send_multipart(msg, copy=False, track=True)
 
         def add_pending(f: asyncio.Future[zmq.MessageTracker]):
-            with contextlib.suppress(BaseException):
+            # GPURES_MINIMAL_ASYNC_CALLBACK
+            try:
                 self.add_pending_message(f.result(), objects)
+            except BaseException:
+                from vllm.multimodal.gpures_minimal import release_request_tokens
+                release_request_tokens(objects)
 
         future.add_done_callback(add_pending)
         return future

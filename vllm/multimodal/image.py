@@ -169,28 +169,64 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
             except Exception:
                 code_streams.append(data)
 
-        with torch.cuda.stream(stream_a):
-            decoded_list = decoder.decode(
-                code_streams,
-                cuda_stream=stream_a.cuda_stream,
-            )
-
-        stream_a.synchronize()
-
-        results = []
-        for i, decoded in enumerate(decoded_list):
-            if decoded is None:
-                raise ValueError(
-                    "nvimagecodec GPU-resident batch decode failed."
+        # REFLEAK_FIX_DECODE_BATCH — explicit dlpack-view drop +
+        # immediate code_streams del + post-loop decoded del +
+        # post-clone synchronize so nvimgcodec pool slots release
+        # before this function returns. See patches/refleak-fix/
+        # apply_patch.py docstring for the full rationale.
+        # GPURES_MINIMAL_DECODE_GATE
+        from vllm.multimodal.gpures_minimal import reserve_decode_batch
+        _gpures_decode_token = reserve_decode_batch(
+            len(code_streams), "nvimagecodec.decode"
+        )
+        try:
+            with torch.cuda.stream(stream_a):
+                decoded_list = decoder.decode(
+                    code_streams,
+                    cuda_stream=stream_a.cuda_stream,
                 )
-            gpu_tensor = torch.from_dlpack(decoded).clone()
-            results.append(gpu_tensor)
-            # Free nvimgcodec buffer reference (t465: prevent decoder
-            # buffers from being held via the decoded_list)
-            decoded_list[i] = None
 
-        del decoded_list
-        return results
+            # Drop the per-image CodeStream descriptor list immediately;
+            # the decoder has consumed them and any pinned per-stream
+            # GPU scratch can release now.
+            del code_streams
+
+            stream_a.synchronize()
+
+            results = []
+            for i, decoded in enumerate(decoded_list):
+                if decoded is None:
+                    raise ValueError(
+                        "nvimagecodec GPU-resident batch decode failed."
+                    )
+                # Explicit dlpack view binding so we can `del` it at a
+                # deterministic point. If nvimgcodec's __dlpack__
+                # deleter is responsible for releasing the pool slot,
+                # this is what triggers it. ``view.clone()`` produces
+                # a brand-new PyTorch-owned buffer.
+                view = torch.from_dlpack(decoded)
+                gpu_tensor = view.clone()
+                del view
+                # GPURES_MINIMAL_DECODE_RESIDENCY
+                from vllm.multimodal.gpures_minimal import attach_decode_residency
+                attach_decode_residency(gpu_tensor, f"nvimagecodec.decoded.{i}")
+                results.append(gpu_tensor)
+                # Free nvimgcodec buffer reference (t465: prevent decoder
+                # buffers from being held via the decoded_list)
+                decoded_list[i] = None
+
+            # The for-loop binds `decoded` to the last item; drop it so
+            # the last nvimgcodec Image object decrefs before return.
+            del decoded
+            del decoded_list
+            # Make sure the clones and any in-flight deleters finish
+            # before we hand `results` back to the caller — otherwise
+            # the dlpack deleter may still be queued and the underlying
+            # pool slot stays pinned.
+            torch.cuda.synchronize()
+            return results
+        finally:
+            _gpures_decode_token.release()
 
     @classmethod
     def load_bytes(cls, data: bytes, **kwargs):
@@ -222,7 +258,14 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
                     timeout=cls._batch_timeout_s + 0.01
                 ):
                     cls._flush_batch()
-                    done_event.wait(timeout=5.0)
+                    # GPURES_MINIMAL_DECODE_WAIT
+                    _gpures_wait_s = float(os.environ.get(
+                        "VLLM_GPU_DECODE_RESULT_WAIT_TIMEOUT_S", "0"
+                    ) or "0")
+                    if _gpures_wait_s > 0:
+                        done_event.wait(timeout=_gpures_wait_s)
+                    else:
+                        done_event.wait()
 
             if not result_holder:
                 raise ValueError("Batch decode produced no result.")
@@ -243,17 +286,27 @@ class NVImageCodecGPUResidentLoader(BatchImageLoader):
             items = list(cls._pending_items)
             cls._pending_items.clear()
 
-        data_list = [item[0] for item in items]
-
+        # GPURES_MINIMAL_FLUSH_CHUNKS
+        from vllm.multimodal.gpures_minimal import decode_batch_limit
+        limit = decode_batch_limit(cls._batch_size)
         try:
-            results = cls._decode_batch_gpu(data_list)
-            for (_, event, holder), result in zip(items, results):
-                holder.append(result)
-                event.set()
+            for start in range(0, len(items), limit):
+                chunk = items[start:start + limit]
+                data_list = [item[0] for item in chunk]
+                results = cls._decode_batch_gpu(data_list)
+                for (_, event, holder), result in zip(chunk, results):
+                    holder.append(result)
+                    event.set()
+                del results
+                del data_list
+                del chunk
         except Exception as e:
             for _, event, holder in items:
-                holder.append(e)
-                event.set()
+                if not event.is_set():
+                    holder.append(e)
+                    event.set()
+        finally:
+            del items
 
     @classmethod
     def load_bytes_batch(
