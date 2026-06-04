@@ -368,13 +368,31 @@ def summary() -> dict[str, Any]:
 def _write_summary() -> None:
     path = os.environ.get("VLLM_GPU_PREPROCESS_SUMMARY_PATH",
                           "/workspace/results/weighted_admission_summary.json")
+    data = summary()
     try:
         if os.path.dirname(path) and not os.path.isdir(os.path.dirname(path)):
             return
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(summary(), f, indent=2, sort_keys=True)
+            json.dump(data, f, indent=2, sort_keys=True)
     except Exception:
         print("[weighted_admission_semaphore] failed to write summary", flush=True)
+    # Keep Benchy's existing weighted-admission log parser working.
+    for gate, prefix in (
+            ("preprocess", ""),
+            ("resident", "resident_"),
+            ("decode", "decode_"),
+            ("decode_residency", "decode_residency_")):
+        print(
+            "[weighted_admission] "
+            f"gate={gate} "
+            f"budget_bytes={data[prefix + 'budget_bytes']} "
+            f"reserved_bytes={data[prefix + 'reserved_bytes']} "
+            f"peak_reserved_bytes={data[prefix + 'peak_reserved_bytes']} "
+            f"inflight={data[prefix + 'inflight']} "
+            f"acquires={data[prefix + 'acquires']} "
+            f"releases={data[prefix + 'releases']}",
+            flush=True,
+        )
 
 
 atexit.register(_write_summary)
